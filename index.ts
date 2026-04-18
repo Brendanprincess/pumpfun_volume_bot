@@ -43,7 +43,12 @@ import {
 import fs from "fs";
 import base58 from "bs58";
 import { bool, publicKey, struct, u64 } from "@raydium-io/raydium-sdk";
-
+process.on('unhandledRejection', (reason) => {
+    console.error('UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('UNCAUGHT EXCEPTION:', err);
+});
 const WALLETS_JSON = "wallets.json";
 const LUT_JSON = "./lut.json";
 
