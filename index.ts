@@ -1157,3 +1157,9 @@ export class PumpfunVbot {
     // }
   }
 }
+// ... your existing code that creates the controller
+const controller = new TelegramController();
+
+// Force the process to stay alive
+console.log("Bot initialized. Keeping process alive...");
+setInterval(() => {}, 1 << 30); // never‑ending interval
