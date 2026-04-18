@@ -4,10 +4,10 @@ export const GLOBAL = new PublicKey(
   "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
 );
 export const FEE_RECIPIENT = new PublicKey(
-  "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
+  "CJYBf5czd3o5k6FFYvKeXzoKR8svRgXWcKCnw2ahf8wB"
 );
 export const FEE_VAULT = new PublicKey(
-  "DWsNRAtt6sey4rzCQWNmmkDS3f8eJ1MEPfgZbWEk88iN"
+  "7mxLcbetSqK3KTAdiAPHdNy5Xd5E4WEdSyYw6mtcXwz4"
 );
 export const TOKEN_PROGRAM_ID = new PublicKey(
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
