@@ -5,8 +5,9 @@
   "main": "index.js",
   "license": "MIT",
   "scripts": {
-    "start": "ts-node index.ts",
+    "start": "ts-node bot.ts",
     "bot": "ts-node bot.ts",
+    "standalone": "ts-node index.ts",
     "build": "tsc",
     "lint": "eslint . --ext .ts"
   },
