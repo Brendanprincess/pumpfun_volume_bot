@@ -1,7 +1,3 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
-// Imports for PumpfunVbot (keep everything as you had)
 import {
   AddressLookupTableAccount,
   AddressLookupTableProgram,
@@ -16,6 +12,7 @@ import {
 } from "@solana/web3.js";
 import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
+
 import {
   GLOBAL,
   FEE_RECIPIENT,
@@ -27,6 +24,7 @@ import {
   ASSOC_TOKEN_ACC_PROG,
   MAX_LIMIT,
 } from "./src/constants";
+
 import { JitoBundleService, tipAccounts } from "./src/jito.bundle";
 import {
   bufferFromUInt64,
@@ -46,17 +44,9 @@ import fs from "fs";
 import base58 from "bs58";
 import { bool, publicKey, struct, u64 } from "@raydium-io/raydium-sdk";
 
-// ==================== Global error handlers ====================
-process.on('unhandledRejection', (reason) => {
-    console.error('❌ UNHANDLED REJECTION:', reason);
-});
-process.on('uncaughtException', (err) => {
-    console.error('💥 UNCAUGHT EXCEPTION:', err);
-});
-
-// ==================== PumpfunVbot class (unchanged from your code) ====================
 const WALLETS_JSON = "wallets.json";
 const LUT_JSON = "./lut.json";
+
 const FEE_ATA_LAMPORTS = 2039280;
 
 export class PumpfunVbot {
@@ -1167,12 +1157,3 @@ export class PumpfunVbot {
     // }
   }
 }
-
-// ==================== Import TelegramController and start the bot ====================
-import TelegramController from './bot';   // <-- make sure this path is correct
-
-const controller = new TelegramController();
-
-// Force the process to stay alive (prevents Railway from stopping the container)
-console.log("✅ Bot initialized. Keeping process alive...");
-setInterval(() => {}, 1 << 30); // never‑ending interval
