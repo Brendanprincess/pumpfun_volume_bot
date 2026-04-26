@@ -1,6 +1,6 @@
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import base58 from "bs58";
-import dotenv from "dotenv";
+import * as dotenv from "dotenv";
 dotenv.config();
 
 // --- Essential Configurations - Bot will not run without these ---

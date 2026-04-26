@@ -40,14 +40,28 @@ import {
   DefaultSlippage,
   DefaultCA,
 } from "./src/config";
-import fs from "fs";
-import base58 from "bs58";
-import { bool, publicKey, struct, u64 } from "@raydium-io/raydium-sdk";
+import * as fs from "fs";
+import * as ray from "@raydium-io/raydium-sdk";
+import {
+  Liquidity,
+  Percent,
+  SPL_ACCOUNT_LAYOUT,
+  Token,
+  TokenAccount,
+  TokenAmount,
+  bool,
+  jsonInfo2PoolKeys,
+  publicKey,
+  struct,
+  u64,
+} from "@raydium-io/raydium-sdk";
+import BN from "bn.js";
 
 const WALLETS_JSON = "wallets.json";
 const LUT_JSON = "./lut.json";
 
 const FEE_ATA_LAMPORTS = 2039280;
+const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 
 export class PumpfunVbot {
   slippage: number;
@@ -62,6 +76,10 @@ export class PumpfunVbot {
   lookupTableAccount!: AddressLookupTableAccount;
   distributeAmountLamports: number;
   jitoTipAmountLamports: number;
+  private static raydiumPoolsLoaded: any[] | null = null;
+  private static raydiumPoolKeysById: Map<string, any> = new Map();
+  private static raydiumClmmPoolsLoaded: any[] | null = null;
+  private static raydiumClmmPoolKeysById: Map<string, any> = new Map();
 
   constructor(
     CA: string,
@@ -165,7 +183,7 @@ export class PumpfunVbot {
     const pks = [];
     for (let i = 0; i < total; i++) {
       const wallet = Keypair.generate();
-      pks.push(base58.encode(wallet.secretKey));
+      pks.push(bs58.encode(wallet.secretKey));
     }
     fs.writeFileSync(WALLETS_JSON, JSON.stringify(pks, null, 2));
     try {
@@ -184,7 +202,7 @@ export class PumpfunVbot {
     const keypairs = [];
     const walletsData = JSON.parse(fs.readFileSync(WALLETS_JSON, "utf8"));
     for (const walletSecret of walletsData) {
-      const keypair = Keypair.fromSecretKey(base58.decode(walletSecret));
+      const keypair = Keypair.fromSecretKey(bs58.decode(walletSecret));
       keypairs.push(keypair);
       if (keypairs.length >= total) break;
     }
@@ -414,6 +432,52 @@ export class PumpfunVbot {
     } catch (e: any) {
       console.error("Error distributing SOL:", e.message);
       throw new Error("Failed to distribute SOL.");
+    }
+  }
+
+  async distributeSOLChunked(perWalletLamports: number, chunkSize = 10) {
+    if (!Number.isFinite(perWalletLamports) || perWalletLamports <= 0) {
+      throw new Error("Invalid perWalletLamports.");
+    }
+    if (!this.keypairs || this.keypairs.length === 0) {
+      throw new Error("No wallets loaded to distribute SOL to.");
+    }
+    const walletsToDistribute = this.keypairs.filter(kp => !kp.publicKey.equals(userKeypair.publicKey));
+    if (walletsToDistribute.length === 0) return;
+
+    const totalRequired = perWalletLamports * walletsToDistribute.length;
+    const solBal = await connection.getBalance(userKeypair.publicKey, "confirmed");
+    if (solBal < totalRequired + 200_000) {
+      throw new Error("Insufficient SOL in main wallet for distribution.");
+    }
+
+    const chunks = chunkArray(walletsToDistribute, Math.max(1, Math.floor(chunkSize)));
+    for (const chunk of chunks) {
+      const instructions: TransactionInstruction[] = [];
+      for (const kp of chunk) {
+        instructions.push(
+          SystemProgram.transfer({
+            fromPubkey: userKeypair.publicKey,
+            toPubkey: kp.publicKey,
+            lamports: perWalletLamports,
+          })
+        );
+      }
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      const messageV0 = new TransactionMessage({
+        payerKey: userKeypair.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+      }).compileToV0Message();
+
+      const vTxn = new VersionedTransaction(messageV0);
+      vTxn.sign([userKeypair]);
+      const sig = await connection.sendRawTransaction(vTxn.serialize(), {
+        skipPreflight: true,
+        maxRetries: 3,
+        preflightCommitment: "confirmed",
+      });
+      await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
     }
   }
 
@@ -726,7 +790,585 @@ export class PumpfunVbot {
     console.log("Lookup table loaded successfully. Last extended slot:", this.lookupTableAccount.state.lastExtendedSlot);
   }
 
-  async swap() {
+  private async getTransactionLamportVolume(signature: string, payer: PublicKey): Promise<{ volumeLamports: number; feeLamports: number; netLamportsForPayer: number } | null> {
+    try {
+      const tx = await connection.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      const meta = tx?.meta;
+      const message = tx?.transaction.message;
+      if (!meta || !message) return null;
+      const feeLamports = meta.fee ?? 0;
+      const accountKeys = message.getAccountKeys().staticAccountKeys;
+      const payerIndex = accountKeys.findIndex(k => k.equals(payer));
+      if (payerIndex < 0) return null;
+      const pre = meta.preBalances?.[payerIndex] ?? 0;
+      const post = meta.postBalances?.[payerIndex] ?? 0;
+      const netLamportsForPayer = post - pre;
+      const volumeLamports =
+        netLamportsForPayer < 0
+          ? Math.max(0, -netLamportsForPayer - feeLamports)
+          : Math.max(0, netLamportsForPayer + feeLamports);
+      return { volumeLamports, feeLamports, netLamportsForPayer };
+    } catch {
+      return null;
+    }
+  }
+
+  async getTokenBalance(walletPubkey: PublicKey): Promise<bigint> {
+    const ata = spl.getAssociatedTokenAddressSync(this.mint, walletPubkey, true);
+    try {
+      const ataInfo = await spl.getAccount(connection, ata, "confirmed");
+      return ataInfo.amount;
+    } catch {
+      return 0n;
+    }
+  }
+
+  private static async loadRaydiumPools(): Promise<any[]> {
+    if (PumpfunVbot.raydiumPoolsLoaded) return PumpfunVbot.raydiumPoolsLoaded;
+    const res = await fetch("https://api.raydium.io/v2/sdk/liquidity/mainnet.json", { method: "GET" });
+    if (!res.ok) throw new Error(`Failed to load Raydium pools: HTTP ${res.status}`);
+    const data: any = await res.json();
+    const official = Array.isArray(data?.official) ? data.official : [];
+    const unOfficial = Array.isArray(data?.unOfficial) ? data.unOfficial : [];
+    PumpfunVbot.raydiumPoolsLoaded = [...official, ...unOfficial];
+    return PumpfunVbot.raydiumPoolsLoaded;
+  }
+
+  private static async loadRaydiumClmmPools(): Promise<any[]> {
+    if (PumpfunVbot.raydiumClmmPoolsLoaded) return PumpfunVbot.raydiumClmmPoolsLoaded;
+    const res = await fetch("https://api.raydium.io/v2/sdk/clmm/mainnet.json", { method: "GET" });
+    if (!res.ok) throw new Error(`Failed to load Raydium CLMM pools: HTTP ${res.status}`);
+    const data: any = await res.json();
+    const pools = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+    PumpfunVbot.raydiumClmmPoolsLoaded = pools;
+    return pools;
+  }
+
+  private static async getRaydiumClmmPoolKeys(poolId: string): Promise<any> {
+    const cached = PumpfunVbot.raydiumClmmPoolKeysById.get(poolId);
+    if (cached) return cached;
+    const pools = await PumpfunVbot.loadRaydiumClmmPools();
+    const found = pools.find((p: any) => p?.id === poolId || p?.poolId === poolId || p?.ammId === poolId);
+    if (!found) throw new Error(`Raydium CLMM pool not found: ${poolId}`);
+    const keys = jsonInfo2PoolKeys(found);
+    PumpfunVbot.raydiumClmmPoolKeysById.set(poolId, keys);
+    return keys;
+  }
+
+  private static async getRaydiumPoolKeys(poolId: string): Promise<any> {
+    const cached = PumpfunVbot.raydiumPoolKeysById.get(poolId);
+    if (cached) return cached;
+    const pools = await PumpfunVbot.loadRaydiumPools();
+    const found = pools.find((p: any) => p?.id === poolId || p?.ammId === poolId);
+    if (!found) throw new Error(`Raydium pool not found: ${poolId}`);
+    const keys = jsonInfo2PoolKeys(found);
+    PumpfunVbot.raydiumPoolKeysById.set(poolId, keys);
+    return keys;
+  }
+
+  private async getRaydiumWalletTokenAccounts(owner: PublicKey): Promise<TokenAccount[]> {
+    const tokenResp = await connection.getTokenAccountsByOwner(owner, { programId: spl.TOKEN_PROGRAM_ID }, "confirmed");
+    const accounts: TokenAccount[] = [];
+    for (const { pubkey, account } of tokenResp.value) {
+      accounts.push({ pubkey, accountInfo: SPL_ACCOUNT_LAYOUT.decode(account.data) } as any);
+    }
+    return accounts;
+  }
+
+  private async createTempWsolAccount(payer: Keypair, lamports: number): Promise<{ wsolAccount: Keypair; instructions: TransactionInstruction[]; cleanupInstructions: TransactionInstruction[] }> {
+    const wsolAccount = Keypair.generate();
+    const rent = await connection.getMinimumBalanceForRentExemption(165);
+    const createIx = SystemProgram.createAccount({
+      fromPubkey: payer.publicKey,
+      newAccountPubkey: wsolAccount.publicKey,
+      lamports: rent + Math.max(0, lamports),
+      space: 165,
+      programId: spl.TOKEN_PROGRAM_ID,
+    });
+    const initIx = spl.createInitializeAccountInstruction(wsolAccount.publicKey, WSOL_MINT, payer.publicKey);
+    const syncIx = spl.createSyncNativeInstruction(wsolAccount.publicKey);
+    const closeIx = spl.createCloseAccountInstruction(wsolAccount.publicKey, payer.publicKey, payer.publicKey);
+    return { wsolAccount, instructions: [createIx, initIx, syncIx], cleanupInstructions: [closeIx] };
+  }
+
+  async executeRaydiumBuy(poolId: string, wallet: Keypair, solAmountLamports: number): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (solAmountLamports <= 0) return null;
+    const poolKeys = await PumpfunVbot.getRaydiumPoolKeys(poolId);
+    const baseMint = new PublicKey(poolKeys.baseMint);
+    const quoteMint = new PublicKey(poolKeys.quoteMint);
+    if (!baseMint.equals(WSOL_MINT) && !quoteMint.equals(WSOL_MINT)) return null;
+    const outMint = baseMint.equals(WSOL_MINT) ? quoteMint : baseMint;
+    const outAta = spl.getAssociatedTokenAddressSync(outMint, wallet.publicKey, true);
+    const createOutAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, outAta, wallet.publicKey, outMint);
+    const { wsolAccount, instructions: wrapIxs, cleanupInstructions } = await this.createTempWsolAccount(wallet, solAmountLamports);
+
+    const poolInfo = await Liquidity.fetchInfo({ connection, poolKeys });
+    const slippage = new Percent(Math.floor(this.slippage * 10000), 10000);
+    const inToken = new Token(spl.TOKEN_PROGRAM_ID, WSOL_MINT, 9);
+    const outDecimals = baseMint.equals(WSOL_MINT) ? Number(poolKeys.quoteDecimals) : Number(poolKeys.baseDecimals);
+    const outToken = new Token(spl.TOKEN_PROGRAM_ID, outMint, outDecimals);
+    const amountIn = new TokenAmount(inToken, new BN(solAmountLamports));
+    const computed = Liquidity.computeAmountOut({ poolKeys, poolInfo, amountIn, currencyOut: outToken, slippage });
+    const minAmountOut = computed.minAmountOut as any;
+    const minOutBn: BN = (minAmountOut?.raw as BN) ?? new BN(0);
+
+    const swap = Liquidity.makeSwapFixedInInstruction(
+      {
+        poolKeys,
+        userKeys: {
+          tokenAccountIn: wsolAccount.publicKey,
+          tokenAccountOut: outAta,
+          owner: wallet.publicKey,
+        },
+        amountIn: new BN(solAmountLamports),
+        minAmountOut: minOutBn,
+      } as any,
+      poolKeys.version
+    ) as any;
+
+    const extraSigners: Keypair[] = (swap?.innerTransaction?.signers ?? []).filter(Boolean);
+    const ixs: TransactionInstruction[] = [
+      createOutAta,
+      ...wrapIxs,
+      ...(swap?.innerTransaction?.instructions ?? swap?.innerTransactions?.flatMap((t: any) => t.instructions ?? []) ?? []),
+      ...cleanupInstructions,
+    ].filter(Boolean);
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions: ixs,
+    }).compileToV0Message();
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet, wsolAccount, ...extraSigners]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executeRaydiumSell(poolId: string, wallet: Keypair, tokenAmount: bigint): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (tokenAmount <= 0n) return null;
+    const poolKeys = await PumpfunVbot.getRaydiumPoolKeys(poolId);
+    const baseMint = new PublicKey(poolKeys.baseMint);
+    const quoteMint = new PublicKey(poolKeys.quoteMint);
+    if (!baseMint.equals(WSOL_MINT) && !quoteMint.equals(WSOL_MINT)) return null;
+    const inMint = baseMint.equals(WSOL_MINT) ? quoteMint : baseMint;
+    const inAta = spl.getAssociatedTokenAddressSync(inMint, wallet.publicKey, true);
+    const createInAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, inAta, wallet.publicKey, inMint);
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    const requested = tokenAmount > maxSafe ? maxSafe : tokenAmount;
+    if (requested <= 0n) return null;
+
+    const { wsolAccount, instructions: wrapIxs, cleanupInstructions } = await this.createTempWsolAccount(wallet, 0);
+
+    const poolInfo = await Liquidity.fetchInfo({ connection, poolKeys });
+    const slippage = new Percent(Math.floor(this.slippage * 10000), 10000);
+    const inDecimals = baseMint.equals(WSOL_MINT) ? Number(poolKeys.quoteDecimals) : Number(poolKeys.baseDecimals);
+    const inToken = new Token(spl.TOKEN_PROGRAM_ID, inMint, inDecimals);
+    const outToken = new Token(spl.TOKEN_PROGRAM_ID, WSOL_MINT, 9);
+    const amountIn = new TokenAmount(inToken, new BN(requested.toString()));
+    const computed = Liquidity.computeAmountOut({ poolKeys, poolInfo, amountIn, currencyOut: outToken, slippage });
+    const minAmountOut = computed.minAmountOut as any;
+    const minOutBn: BN = (minAmountOut?.raw as BN) ?? new BN(0);
+
+    const swap = Liquidity.makeSwapFixedInInstruction(
+      {
+        poolKeys,
+        userKeys: {
+          tokenAccountIn: inAta,
+          tokenAccountOut: wsolAccount.publicKey,
+          owner: wallet.publicKey,
+        },
+        amountIn: new BN(requested.toString()),
+        minAmountOut: minOutBn,
+      } as any,
+      poolKeys.version
+    ) as any;
+
+    const extraSigners: Keypair[] = (swap?.innerTransaction?.signers ?? []).filter(Boolean);
+    const ixs: TransactionInstruction[] = [
+      createInAta,
+      ...wrapIxs,
+      ...(swap?.innerTransaction?.instructions ?? swap?.innerTransactions?.flatMap((t: any) => t.instructions ?? []) ?? []),
+      ...cleanupInstructions,
+    ].filter(Boolean);
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions: ixs,
+    }).compileToV0Message();
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet, wsolAccount, ...extraSigners]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executeRaydiumClmmBuy(poolId: string, wallet: Keypair, solAmountLamports: number): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (solAmountLamports <= 0) return null;
+    const poolKeys = await PumpfunVbot.getRaydiumClmmPoolKeys(poolId);
+    const mintA: PublicKey = poolKeys?.mintA?.address ?? poolKeys?.mintA ?? poolKeys?.mintAAddress;
+    const mintB: PublicKey = poolKeys?.mintB?.address ?? poolKeys?.mintB ?? poolKeys?.mintBAddress;
+    const mA = mintA instanceof PublicKey ? mintA : new PublicKey(String(mintA));
+    const mB = mintB instanceof PublicKey ? mintB : new PublicKey(String(mintB));
+    if (!mA.equals(WSOL_MINT) && !mB.equals(WSOL_MINT)) return null;
+    const outMint = mA.equals(WSOL_MINT) ? mB : mA;
+    const tokenAccounts = await this.getRaydiumWalletTokenAccounts(wallet.publicKey);
+
+    const amountIn = new BN(solAmountLamports);
+    const slippage = new Percent(Math.floor(this.slippage * 10000), 10000);
+
+    const pools = await PumpfunVbot.loadRaydiumClmmPools();
+    const found = pools.find((p: any) => p?.id === poolId || p?.poolId === poolId || p?.ammId === poolId);
+    if (!found) throw new Error(`Raydium CLMM pool not found: ${poolId}`);
+
+    const poolInfos = await ray.Clmm.fetchMultiplePoolInfos({
+      connection,
+      poolKeys: [found],
+      chainTime: Math.floor(Date.now() / 1000),
+    });
+    const poolInfo = poolInfos[found.id].state;
+
+    const swapBuild = await ray.Clmm.makeSwapBaseInInstructionSimple({
+      connection,
+      poolInfo,
+      ownerInfo: {
+        wallet: wallet.publicKey,
+        feePayer: wallet.publicKey,
+        tokenAccounts,
+        useSOLBalance: true,
+      },
+      inputMint: WSOL_MINT,
+      amountIn,
+      amountOutMin: new BN(0),
+      remainingAccounts: [],
+      makeTxVersion: ray.TxVersion.V0,
+    });
+
+    const innerTxs = swapBuild.innerTransactions;
+    if (innerTxs.length === 0) return null;
+    const txs = await ray.buildSimpleTransaction({
+      connection,
+      makeTxVersion: ray.TxVersion.V0,
+      payer: wallet.publicKey,
+      innerTransactions: innerTxs,
+    });
+    const vTxn = txs[0] as VersionedTransaction;
+    vTxn.sign([wallet, ...(innerTxs[0]?.signers ?? [])]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executeRaydiumClmmSell(poolId: string, wallet: Keypair, tokenAmount: bigint): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (tokenAmount <= 0n) return null;
+    const poolKeys = await PumpfunVbot.getRaydiumClmmPoolKeys(poolId);
+    const mintA: PublicKey = poolKeys?.mintA?.address ?? poolKeys?.mintA ?? poolKeys?.mintAAddress;
+    const mintB: PublicKey = poolKeys?.mintB?.address ?? poolKeys?.mintB ?? poolKeys?.mintBAddress;
+    const mA = mintA instanceof PublicKey ? mintA : new PublicKey(String(mintA));
+    const mB = mintB instanceof PublicKey ? mintB : new PublicKey(String(mintB));
+    if (!mA.equals(WSOL_MINT) && !mB.equals(WSOL_MINT)) return null;
+    const inMint = mA.equals(WSOL_MINT) ? mB : mA;
+    const tokenAccounts = await this.getRaydiumWalletTokenAccounts(wallet.publicKey);
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    const requested = tokenAmount > maxSafe ? maxSafe : tokenAmount;
+    if (requested <= 0n) return null;
+
+    const amountIn = new BN(requested.toString());
+    const slippage = new Percent(Math.floor(this.slippage * 10000), 10000);
+    const pools = await PumpfunVbot.loadRaydiumClmmPools();
+    const found = pools.find((p: any) => p?.id === poolId || p?.poolId === poolId || p?.ammId === poolId);
+    if (!found) throw new Error(`Raydium CLMM pool not found: ${poolId}`);
+
+    const poolInfos = await ray.Clmm.fetchMultiplePoolInfos({
+      connection,
+      poolKeys: [found],
+      chainTime: Math.floor(Date.now() / 1000),
+    });
+    const poolInfo = poolInfos[found.id].state;
+
+    const swapBuild = await ray.Clmm.makeSwapBaseInInstructionSimple({
+      connection,
+      poolInfo,
+      ownerInfo: {
+        wallet: wallet.publicKey,
+        feePayer: wallet.publicKey,
+        tokenAccounts,
+        useSOLBalance: true,
+      },
+      inputMint: inMint,
+      amountIn,
+      amountOutMin: new BN(0),
+      remainingAccounts: [],
+      makeTxVersion: ray.TxVersion.V0,
+    });
+
+    const innerTxs = swapBuild.innerTransactions;
+    if (innerTxs.length === 0) return null;
+    const txs = await ray.buildSimpleTransaction({
+      connection,
+      makeTxVersion: ray.TxVersion.V0,
+      payer: wallet.publicKey,
+      innerTransactions: innerTxs,
+    });
+    const vTxn = txs[0] as VersionedTransaction;
+    vTxn.sign([wallet, ...(innerTxs[0]?.signers ?? [])]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executeMeteoraBuy(poolId: string, wallet: Keypair, solAmountLamports: number): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (solAmountLamports <= 0) return null;
+    const { default: DLMM }: any = require("@meteora-ag/dlmm");
+    const dlmmPool = await DLMM.create(connection, new PublicKey(poolId));
+    await dlmmPool.refetchStates();
+    const tokenX: PublicKey = dlmmPool.tokenX.publicKey;
+    const tokenY: PublicKey = dlmmPool.tokenY.publicKey;
+    if (!tokenX.equals(WSOL_MINT) && !tokenY.equals(WSOL_MINT)) return null;
+    const inMint = WSOL_MINT;
+    const outMint = tokenX.equals(WSOL_MINT) ? tokenY : tokenX;
+    const outAta = spl.getAssociatedTokenAddressSync(outMint, wallet.publicKey, true);
+    const wsolAta = spl.getAssociatedTokenAddressSync(WSOL_MINT, wallet.publicKey, true);
+    const createOutAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, outAta, wallet.publicKey, outMint);
+    const createWsolAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, wsolAta, wallet.publicKey, WSOL_MINT);
+    const wrapIxs: TransactionInstruction[] = [
+      createWsolAta,
+      SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: wsolAta, lamports: solAmountLamports }),
+      spl.createSyncNativeInstruction(wsolAta),
+    ];
+
+    const inAmount = new BN(solAmountLamports);
+    const swapYtoX = inMint.equals(tokenX);
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapYtoX);
+    const slippageBps = Math.max(1, Math.floor(this.slippage * 10000));
+    const swapQuote = await dlmmPool.swapQuote(inAmount, swapYtoX, new BN(slippageBps), binArrays);
+    const swapTx = await dlmmPool.swap({
+      inToken: inMint,
+      outToken: outMint,
+      binArraysPubkey: swapQuote.binArraysPubkey,
+      inAmount,
+      lbPair: dlmmPool.pubkey,
+      user: wallet.publicKey,
+      minOutAmount: swapQuote.minOutAmount,
+    });
+
+    const swapIxs: TransactionInstruction[] = (swapTx?.instructions ?? []).filter(Boolean);
+    const allIxs = [createOutAta, ...wrapIxs, ...swapIxs].filter(Boolean);
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({ payerKey: wallet.publicKey, recentBlockhash: blockhash, instructions: allIxs }).compileToV0Message();
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executeMeteoraSell(poolId: string, wallet: Keypair, tokenAmount: bigint): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (tokenAmount <= 0n) return null;
+    const { default: DLMM }: any = require("@meteora-ag/dlmm");
+    const dlmmPool = await DLMM.create(connection, new PublicKey(poolId));
+    await dlmmPool.refetchStates();
+    const tokenX: PublicKey = dlmmPool.tokenX.publicKey;
+    const tokenY: PublicKey = dlmmPool.tokenY.publicKey;
+    if (!tokenX.equals(WSOL_MINT) && !tokenY.equals(WSOL_MINT)) return null;
+    const inMint = tokenX.equals(WSOL_MINT) ? tokenY : tokenX;
+    const outMint = WSOL_MINT;
+    const inAta = spl.getAssociatedTokenAddressSync(inMint, wallet.publicKey, true);
+    const wsolAta = spl.getAssociatedTokenAddressSync(WSOL_MINT, wallet.publicKey, true);
+    const createInAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, inAta, wallet.publicKey, inMint);
+    const createWsolAta = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, wsolAta, wallet.publicKey, WSOL_MINT);
+
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    const requested = tokenAmount > maxSafe ? maxSafe : tokenAmount;
+    if (requested <= 0n) return null;
+
+    const inAmount = new BN(requested.toString());
+    const swapYtoX = inMint.equals(tokenX);
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapYtoX);
+    const slippageBps = Math.max(1, Math.floor(this.slippage * 10000));
+    const swapQuote = await dlmmPool.swapQuote(inAmount, swapYtoX, new BN(slippageBps), binArrays);
+    const swapTx = await dlmmPool.swap({
+      inToken: inMint,
+      outToken: outMint,
+      binArraysPubkey: swapQuote.binArraysPubkey,
+      inAmount,
+      lbPair: dlmmPool.pubkey,
+      user: wallet.publicKey,
+      minOutAmount: swapQuote.minOutAmount,
+    });
+
+    const swapIxs: TransactionInstruction[] = (swapTx?.instructions ?? []).filter(Boolean);
+    const allIxs = [createInAta, createWsolAta, ...swapIxs].filter(Boolean);
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({ payerKey: wallet.publicKey, recentBlockhash: blockhash, instructions: allIxs }).compileToV0Message();
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: "confirmed" });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executePumpBuy(wallet: Keypair, solAmountLamports: number): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (solAmountLamports <= 0) return null;
+    if (!this.lookupTableAccount) {
+      await this.loadLUT();
+      if (!this.lookupTableAccount) return null;
+    }
+    if (!this.bondingCurve || !this.associatedBondingCurve || !this.creator) {
+      await this.getPumpData();
+    }
+
+    const solBalance = await connection.getBalance(wallet.publicKey, "confirmed");
+    if (solBalance <= solAmountLamports + 20000) return null;
+
+    const tokenATA = spl.getAssociatedTokenAddressSync(this.mint, wallet.publicKey, true);
+    const splAta = tokenATA;
+    const CREATOR_FEE_VAULT = PublicKey.findProgramAddressSync(
+      [Buffer.from("creator-vault"), this.creator.toBuffer()],
+      PUMP_FUN_PROGRAM
+    )[0];
+
+    if (this.virtualSolReserves === 0) return null;
+    const estimatedTokenOut = Math.floor((solAmountLamports * this.virtualTokenReserves) / this.virtualSolReserves);
+    if (estimatedTokenOut <= 0) return null;
+    const maxSolCost = Math.floor(solAmountLamports * (1 + this.slippage));
+    const buyData = Buffer.concat([
+      bufferFromUInt64("16927863322537952870"),
+      bufferFromUInt64(estimatedTokenOut),
+      bufferFromUInt64(maxSolCost),
+    ]);
+
+    const buyKeys = [
+      { pubkey: GLOBAL, isSigner: false, isWritable: false },
+      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
+      { pubkey: this.mint, isSigner: false, isWritable: false },
+      { pubkey: this.bondingCurve, isSigner: false, isWritable: true },
+      { pubkey: this.associatedBondingCurve, isSigner: false, isWritable: true },
+      { pubkey: splAta, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: false, isWritable: true },
+      { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: true },
+      { pubkey: CREATOR_FEE_VAULT, isSigner: false, isWritable: true },
+      { pubkey: PUMP_FUN_ACCOUNT, isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_PROGRAM, isSigner: false, isWritable: false },
+    ];
+
+    const instructions: TransactionInstruction[] = [
+      spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, tokenATA, wallet.publicKey, this.mint),
+      new TransactionInstruction({ keys: buyKeys, programId: PUMP_FUN_PROGRAM, data: buyData }),
+    ];
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message([this.lookupTableAccount]);
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), {
+      skipPreflight: true,
+      maxRetries: 3,
+      preflightCommitment: "confirmed",
+    });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async executePumpSell(wallet: Keypair, tokenAmount: bigint): Promise<{ signature: string; volumeLamports: number; feeLamports: number; netLamports: number } | null> {
+    if (tokenAmount <= 0n) return null;
+    if (!this.lookupTableAccount) {
+      await this.loadLUT();
+      if (!this.lookupTableAccount) return null;
+    }
+    if (!this.bondingCurve || !this.associatedBondingCurve || !this.creator) {
+      await this.getPumpData();
+    }
+
+    const tokenATA = spl.getAssociatedTokenAddressSync(this.mint, wallet.publicKey, true);
+    const currentBal = await this.getTokenBalance(wallet.publicKey);
+    if (currentBal <= 0n) return null;
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    const cappedRequested = tokenAmount > maxSafe ? maxSafe : tokenAmount;
+    const sellAmount = cappedRequested > currentBal ? currentBal : cappedRequested;
+    if (sellAmount <= 0n) return null;
+
+    if (this.virtualTokenReserves === 0) return null;
+    if (sellAmount > maxSafe) return null;
+    const minSolOutput = Math.floor(
+      (Number(sellAmount) * (1 - this.slippage) * this.virtualSolReserves) / this.virtualTokenReserves
+    );
+    if (minSolOutput <= 0) return null;
+
+    const sellData = Buffer.concat([
+      bufferFromUInt64("12502976635542562355"),
+      bufferFromUInt64(sellAmount),
+      bufferFromUInt64(minSolOutput),
+    ]);
+
+    const sellKeys = [
+      { pubkey: GLOBAL, isSigner: false, isWritable: false },
+      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
+      { pubkey: this.mint, isSigner: false, isWritable: false },
+      { pubkey: this.bondingCurve, isSigner: false, isWritable: true },
+      { pubkey: this.associatedBondingCurve, isSigner: false, isWritable: true },
+      { pubkey: tokenATA, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+      { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: ASSOC_TOKEN_ACC_PROG, isSigner: false, isWritable: false },
+      { pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_ACCOUNT, isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_PROGRAM, isSigner: false, isWritable: false },
+    ];
+
+    const instructions: TransactionInstruction[] = [
+      new TransactionInstruction({ keys: sellKeys, programId: PUMP_FUN_PROGRAM, data: sellData }),
+    ];
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const messageV0 = new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message([this.lookupTableAccount]);
+    const vTxn = new VersionedTransaction(messageV0);
+    vTxn.sign([wallet]);
+    const signature = await connection.sendRawTransaction(vTxn.serialize(), {
+      skipPreflight: true,
+      maxRetries: 3,
+      preflightCommitment: "confirmed",
+    });
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    const stats = await this.getTransactionLamportVolume(signature, wallet.publicKey);
+    if (!stats) return { signature, volumeLamports: 0, feeLamports: 0, netLamports: 0 };
+    return { signature, volumeLamports: stats.volumeLamports, feeLamports: stats.feeLamports, netLamports: stats.netLamportsForPayer };
+  }
+
+  async swap(): Promise<number> {
+    let estimatedVolumeLamports = 0;
     try {
       console.log("\n- Performing BUY/SELL swap cycle...");
       if (!this.keypairs || this.keypairs.length === 0) throw new Error("Wallets not loaded.");
@@ -746,6 +1388,7 @@ export class PumpfunVbot {
       for (let i = 0; i < chunkedKeypairs.length; i++) {
         const keypairsInChunk = chunkedKeypairs[i];
         const instructions: TransactionInstruction[] = [];
+        let chunkVolumeLamports = 0;
 
         const payerKeypair = keypairsInChunk[0];
 
@@ -902,6 +1545,7 @@ export class PumpfunVbot {
               //   lamports: this.jitoTipAmountLamports,
               // })
             );
+            chunkVolumeLamports += solAmountForSwap * 2;
 
           }
 
@@ -975,6 +1619,7 @@ export class PumpfunVbot {
             blockhash: blockhash,
             lastValidBlockHeight: lastValidBlockHeight
           }, "confirmed");
+          estimatedVolumeLamports += chunkVolumeLamports;
         } catch (e: any) {
           console.error("Error sending buy/sell tx:", e.message);
           throw new Error("Failed to send buy/sell tx.");
@@ -983,6 +1628,7 @@ export class PumpfunVbot {
     } catch (error: any) {
       console.error(`Error during swap cycle: ${error.message}`);
     }
+    return estimatedVolumeLamports;
   }
 
   async sellAllTokensFromWallets() {

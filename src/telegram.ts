@@ -1,43 +1,140 @@
 import TelegramBot from 'node-telegram-bot-api';
+import axios from 'axios';
+import fs from 'fs';
+import { LAMPORTS_PER_SOL, SystemProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { PumpfunVbot } from '../index';
-import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import {
     connection,
     userKeypair,
     DefaultSlippage,
     DefaultCA,
     DefaultDistributeAmountLamports,
+    DefaultJitoTipAmountLamports,
     TELEGRAM_ALLOWED_USER_IDS,
     TELEGRAM_BOT_TOKEN,
 } from './config';
-import fs from 'fs';
+import { FEE_VAULT } from './constants';
 
-// Add missing constant
-const DefaultJitoTipAmountLamports = 1000000; // 0.0001 SOL
+const SUPPORT_URL = 'https://t.me/PegasusSupportBot';
 
-// Rate limiting constants
-const TELEGRAM_RATE_LIMIT_DELAY = 1000; // 1 second between messages
+const FILE_IDS = {
+    start_video: '',
+    volume_booster_image: '',
+    free_trial_image: '',
+    active_tasks_image: '',
+    stats_image: '',
+    referrals_image: '',
+};
+
+const VOLUME_PACKAGES: Record<string, { sol: number; pump_volume: string; pump_duration: string; pump_buy_size: string; pump_makers: string; pump_reward: string; ray_volume: string; ray_duration: string; ray_buy_size: string; ray_makers: string; tasks: number }> = {
+    "2.5": { sol: 2.5, pump_volume: "$9.8K", pump_duration: "20min", pump_buy_size: "0.6/0.7 SOL", pump_makers: "700", pump_reward: "$29-$93", ray_volume: "$54.2K", ray_duration: "1h", ray_buy_size: "0.6/0.7 SOL", ray_makers: "4,900", tasks: 1 },
+    "3.2": { sol: 3.2, pump_volume: "$19.6K", pump_duration: "20min", pump_buy_size: "1.2/1.4 SOL", pump_makers: "700", pump_reward: "$59-$186", ray_volume: "$108.4K", ray_duration: "1h", ray_buy_size: "1.2/1.4 SOL", ray_makers: "4,900", tasks: 1 },
+    "4.7": { sol: 4.7, pump_volume: "$29.4K", pump_duration: "20min", pump_buy_size: "1.8/2.1 SOL", pump_makers: "700", pump_reward: "$88-$279", ray_volume: "$162.6K", ray_duration: "1h", ray_buy_size: "1.8/2.1 SOL", ray_makers: "4,900", tasks: 1 },
+    "9": { sol: 9.0, pump_volume: "$58.8K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "700", pump_reward: "$175-$558", ray_volume: "$325.2K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "4,900", tasks: 1 },
+    "12": { sol: 12.0, pump_volume: "$78.4K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "1,400", pump_reward: "$233-$744", ray_volume: "$433.6K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "9,800", tasks: 2 },
+    "18": { sol: 18.0, pump_volume: "$117.6K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "2,800", pump_reward: "$349-$1116", ray_volume: "$650.4K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "19,600", tasks: 4 },
+    "36": { sol: 36.0, pump_volume: "$235.2K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "5,600", pump_reward: "$697-$2232", ray_volume: "$1.30M", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "39,200", tasks: 8 },
+};
+
+const DURATION_MAPPING: Record<string, { pump: string; ray: string }> = {
+    "20min|1h": { pump: "20min", ray: "1h" },
+    "1h|3h": { pump: "1h", ray: "3h" },
+    "2h|6h": { pump: "2h", ray: "6h" },
+    "4h|12h": { pump: "4h", ray: "12h" },
+    "8h|24h": { pump: "8h", ray: "24h" },
+    "1d|3d": { pump: "1d", ray: "3d" },
+    "2.5d|7d": { pump: "2.3d", ray: "7d" },
+};
+
+const TELEGRAM_RATE_LIMIT_DELAY = 1000;
 const TELEGRAM_MAX_RETRIES = 3;
 let lastMessageTime = 0;
 
-interface BotConfig {
-    solAmount: number;
-    tokenAddress: string;
-    sleepTime: number;
-    isRunning: boolean;
+type TaskStatus = 'active' | 'paused' | 'stopped';
+type Flow =
+    | 'MAIN_MENU'
+    | 'VOLUME_MENU'
+    | 'VOLUME_PACKAGE_SELECT'
+    | 'VOLUME_ORDER_SUMMARY'
+    | 'VOLUME_CA_INPUT'
+    | 'VOLUME_POOLS_SELECT'
+    | 'VOLUME_REVIEW_SUMMARY'
+    | 'VOLUME_PAYMENT'
+    | 'FREE_TRIAL_CA'
+    | 'FREE_TRIAL_POOLS'
+    | 'FREE_TRIAL_SUMMARY'
+    | 'ACTIVE_TASKS'
+    | 'STOPPED_TASKS'
+    | 'STATS'
+    | 'REFERRALS';
+
+interface PoolInfo {
+    address: string;
+    dex: string;
+    market_cap: string;
+    price: string;
+    liquidity: string;
+    url: string;
+}
+
+interface ChatSession {
+    flow: Flow;
+    sleepMs: number;
     slippage: number;
+    solAmount: number;
+    isRunning: boolean;
+    pumpBot: PumpfunVbot | null;
+    selectedTaskId?: string;
+    volume_package: string;
+    volume_duration: string;
+    volume_ca?: string;
+    volume_pools?: PoolInfo[];
+    volume_selected_pool?: PoolInfo;
+    free_trial_ca?: string;
+    free_trial_pools?: PoolInfo[];
+    free_trial_selected_pool?: PoolInfo;
+    paymentStartBalanceLamports?: number;
+    paymentExpectedLamports?: number;
+}
+
+interface VolumeTask {
+    id: string;
+    status: TaskStatus;
+    tokenAddress: string;
+    tokenName: string;
+    poolId: string;
+    poolDex: string;
+    walletPoolSize: number;
+    walletsUsed: number;
+    startedAtMs: number;
+    endsAtMs: number | null;
+    volumeLamports: number;
+    volumeUsd: number;
+    swapCycles: number;
+    packageKey: string | null;
+    durationKey: string | null;
+    phase: 'pump' | 'ray';
+    phaseStartedAtMs: number;
+    phaseVolumeUsd: number;
+    pumpTargetUsd: number;
+    pumpDurationMs: number;
+    rayTargetUsd: number;
+    rayDurationMs: number;
+    pumpBuyMinSol: number;
+    pumpBuyMaxSol: number;
+    rayBuyMinSol: number;
+    rayBuyMaxSol: number;
+    cycleIntervalMs: number;
+    remainingBudgetLamports: number;
+    walletCooldownMs: number;
 }
 
 class TelegramController {
     private bot: TelegramBot;
-    private pumpBot: PumpfunVbot | null = null;
-    private config: BotConfig = {
-        solAmount: DefaultDistributeAmountLamports / LAMPORTS_PER_SOL,
-        tokenAddress: DefaultCA,
-        sleepTime: 5000,
-        isRunning: false,
-        slippage: DefaultSlippage,
-    };
+    private sessionsByChatId: Map<number, ChatSession> = new Map();
+    private tasksByChatId: Map<number, VolumeTask[]> = new Map();
+    private botsByTaskId: Map<string, PumpfunVbot> = new Map();
+    private usedWalletsByTaskId: Map<string, Set<string>> = new Map();
 
     constructor() {
         if (!TELEGRAM_BOT_TOKEN) {
@@ -45,14 +142,60 @@ class TelegramController {
             process.exit(1);
         }
         this.bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-        this.setupCommands();
-        console.log("TelegramController initialized. Allowed users:", TELEGRAM_ALLOWED_USER_IDS.join(', ') || "NONE (CRITICAL SECURITY RISK!)");
+        this.setupHandlers();
+        console.log("TelegramController initialized. Privileged users:", TELEGRAM_ALLOWED_USER_IDS.join(', ') || 'NONE');
+    }
+
+    private getSession(chatId: number): ChatSession {
+        const existing = this.sessionsByChatId.get(chatId);
+        if (existing) return existing;
+        const created: ChatSession = {
+            flow: 'MAIN_MENU',
+            sleepMs: 5000,
+            slippage: DefaultSlippage,
+            solAmount: DefaultDistributeAmountLamports / LAMPORTS_PER_SOL,
+            isRunning: false,
+            pumpBot: null,
+            volume_package: "2.5",
+            volume_duration: "20min|1h",
+        };
+        this.sessionsByChatId.set(chatId, created);
+        return created;
+    }
+
+    private isPrivilegedUser(userId?: number): boolean {
+        if (!userId) return false;
+        if (TELEGRAM_ALLOWED_USER_IDS.length === 0) return false;
+        return TELEGRAM_ALLOWED_USER_IDS.includes(userId);
+    }
+
+    private getTasks(chatId: number): VolumeTask[] {
+        return this.tasksByChatId.get(chatId) ?? [];
+    }
+
+    private upsertTask(chatId: number, task: VolumeTask) {
+        const tasks = this.getTasks(chatId);
+        const next = tasks.filter(t => t.id !== task.id);
+        next.unshift(task);
+        this.tasksByChatId.set(chatId, next);
+        const session = this.getSession(chatId);
+        if (!session.selectedTaskId) session.selectedTaskId = task.id;
+    }
+
+    private getSelectedTask(chatId: number): VolumeTask | undefined {
+        const session = this.getSession(chatId);
+        const tasks = this.getTasks(chatId);
+        if (session.selectedTaskId) {
+            const found = tasks.find(t => t.id === session.selectedTaskId);
+            if (found) return found;
+        }
+        const firstActive = tasks.find(t => t.status === 'active');
+        return firstActive ?? tasks[0];
     }
 
     private async sendMessageWithRetry(chatId: number, text: string, options?: TelegramBot.SendMessageOptions): Promise<TelegramBot.Message> {
         const now = Date.now();
         const timeSinceLastMessage = now - lastMessageTime;
-
         if (timeSinceLastMessage < TELEGRAM_RATE_LIMIT_DELAY) {
             await new Promise(resolve => setTimeout(resolve, TELEGRAM_RATE_LIMIT_DELAY - timeSinceLastMessage));
         }
@@ -66,7 +209,6 @@ class TelegramController {
             } catch (error: any) {
                 if (error.response?.statusCode === 429) {
                     const retryAfter = parseInt(error.response.headers['retry-after']) || 1;
-                    console.log(`Rate limited by Telegram. Waiting ${retryAfter} seconds...`);
                     await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
                     retries++;
                 } else {
@@ -80,7 +222,6 @@ class TelegramController {
     private async editMessageWithRetry(chatId: number, messageId: number, text: string, options?: TelegramBot.EditMessageTextOptions): Promise<TelegramBot.Message | boolean> {
         const now = Date.now();
         const timeSinceLastMessage = now - lastMessageTime;
-
         if (timeSinceLastMessage < TELEGRAM_RATE_LIMIT_DELAY) {
             await new Promise(resolve => setTimeout(resolve, TELEGRAM_RATE_LIMIT_DELAY - timeSinceLastMessage));
         }
@@ -98,7 +239,6 @@ class TelegramController {
             } catch (error: any) {
                 if (error.response?.statusCode === 429) {
                     const retryAfter = parseInt(error.response.headers['retry-after']) || 1;
-                    console.log(`Rate limited by Telegram. Waiting ${retryAfter} seconds...`);
                     await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
                     retries++;
                 } else if (error.message?.includes("message is not modified")) {
@@ -111,513 +251,1203 @@ class TelegramController {
         throw new Error(`Failed to edit message after ${TELEGRAM_MAX_RETRIES} retries`);
     }
 
-    private isUserAllowed(userId?: number): boolean {
-        if (!userId) return false;
-        if (TELEGRAM_ALLOWED_USER_IDS.length === 0) {
-            if (process.env.NODE_ENV === 'development_open') {
-                console.warn("SECURITY_DEV_ONLY: Bot running in open mode due to NODE_ENV=development_open.");
-                return true;
-            }
-            console.error("CRITICAL: No authorized users configured and not in development_open mode. Denying access.");
-            return false;
-        }
-        return TELEGRAM_ALLOWED_USER_IDS.includes(userId);
-    }
-
-    private setupCommands() {
-        this.bot.onText(/\/settings/, (msg) => this.handleGenericCommand(msg, this._handleSettingsLogic));
-        this.bot.onText(/\/status/, (msg) => this.handleGenericCommand(msg, this._handleStatusLogic));
-        this.bot.onText(/\/help/, (msg) => this.handleGenericCommand(msg, this._handleHelpLogic));
-        this.bot.on('callback_query', this.handleCallbackQuery.bind(this));
-    }
-
-    private async handleGenericCommand(msg: TelegramBot.Message, handler: (msg: TelegramBot.Message) => Promise<void>) {
+    private async upsertUi(msg: TelegramBot.Message, text: string, replyMarkup: TelegramBot.InlineKeyboardMarkup, parseMode?: TelegramBot.ParseMode, disableWebPagePreview = true) {
         const chatId = msg.chat.id;
-        const userId = msg.from?.id;
-        if (!this.isUserAllowed(userId)) {
-            await this.sendMessageWithRetry(chatId, "🚫 You are not authorized to use this bot.");
-            console.log(`Unauthorized command attempt by user ID: ${userId} (${msg.text}), chat ID: ${chatId}`);
-            return;
-        }
+        const messageId = msg.message_id;
+        const options: TelegramBot.EditMessageTextOptions = { reply_markup: replyMarkup, disable_web_page_preview: disableWebPagePreview };
+        if (parseMode) options.parse_mode = parseMode;
         try {
-            await handler.call(this, msg);
-        } catch (error) {
-            console.error(`Error processing command "${msg.text}" for user ${userId}:`, error);
-            await this.sendMessageWithRetry(chatId, "🤖 Oops! Something went wrong. Please contact the administrator or check the bot's console logs.");
+            await this.editMessageWithRetry(chatId, messageId, text, options);
+        } catch (e) {
+            const sendOptions: TelegramBot.SendMessageOptions = { reply_markup: replyMarkup, disable_web_page_preview: disableWebPagePreview };
+            if (parseMode) sendOptions.parse_mode = parseMode;
+            await this.sendMessageWithRetry(chatId, text, sendOptions);
         }
     }
 
-    private async _handleHelpLogic(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        const helpText = `🤖 **Pumpfun Volume Bot Help** 🤖
+    private formatUsd(usd: number): string {
+        if (!Number.isFinite(usd) || usd <= 0) return '$0';
+        if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
+        if (usd >= 1_000) return `$${(usd / 1_000).toFixed(1)}K`;
+        return `$${usd.toFixed(2)}`;
+    }
 
-Use /settings to access the main control panel. From there you can:
--   **Set SOL/Swap**: Amount of SOL each sub-wallet uses per buy/sell cycle.
--   **Set Slippage**: Max price deviation for trades (e.g., 1 for 1%).
--   **Set Token**: The Pump.fun token CA to target.
--   **Set Sleep**: Pause duration (ms) between swap cycles.
--   **Start Bot**: Initiates wallet setup (if needed), SOL distribution, and starts the volume generation loop.
--   **Stop Bot**: Halts the volume generation loop.
--   **Sell All Tokens**: Attempts to sell all target tokens from sub-wallets.
--   **Collect All SOL**: Transfers SOL from sub-wallets back to the main wallet.
+    private parseUsdAmount(raw: string): number {
+        const s = raw.trim().replace(/[$,\s]/g, '').toUpperCase();
+        const m = s.match(/^(\d+(?:\.\d+)?)(K|M)?$/);
+        if (!m) return 0;
+        const n = Number.parseFloat(m[1]);
+        if (!Number.isFinite(n) || n <= 0) return 0;
+        const unit = m[2] ?? '';
+        if (unit === 'K') return n * 1_000;
+        if (unit === 'M') return n * 1_000_000;
+        return n;
+    }
 
-Other commands:
-/status - Show current bot configuration and running state.
-/help - Display this message.
+    private parseBuySizeRange(raw: string): { min: number; max: number } {
+        const s = raw.replace(/SOL/gi, '').trim();
+        const parts = s.split('/').map(p => Number.parseFloat(p.trim()));
+        if (parts.length === 1 && Number.isFinite(parts[0])) return { min: parts[0], max: parts[0] };
+        const min = Number.isFinite(parts[0]) ? parts[0] : 0;
+        const max = Number.isFinite(parts[1]) ? parts[1] : min;
+        return { min: Math.min(min, max), max: Math.max(min, max) };
+    }
 
-**IMPORTANT:**
-- Ensure your main wallet (from \`.env\`) is funded.
-- Set \`TELEGRAM_ALLOWED_USER_IDS\` in \`.env\` to restrict access.
-- The bot creates \`wallets.json\` and \`lut.json\`. Do not edit them manually unless you know what you're doing.`;
+    private parseDurationToMs(duration: string): number | null {
+        const d = duration.trim();
+        const m = d.match(/^(\d+(?:\.\d+)?)\s*(min|h|d)$/i);
+        if (!m) return null;
+        const n = Number.parseFloat(m[1]);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        const unit = m[2].toLowerCase();
+        if (unit === 'min') return Math.floor(n * 60_000);
+        if (unit === 'h') return Math.floor(n * 3_600_000);
+        if (unit === 'd') return Math.floor(n * 86_400_000);
+        return null;
+    }
 
+    private clamp(n: number, min: number, max: number): number {
+        return Math.max(min, Math.min(max, n));
+    }
+
+    private randomBetween(min: number, max: number): number {
+        if (!Number.isFinite(min) || !Number.isFinite(max) || max <= 0) return 0;
+        const lo = Math.min(min, max);
+        const hi = Math.max(min, max);
+        return lo + Math.random() * (hi - lo);
+    }
+
+    private formatNumber(value: unknown): string {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A';
+        if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+        if (value >= 1_000) return `${(value / 1_000).toFixed(2)}K`;
+        return `${value.toFixed(4)}`;
+    }
+
+    private async getSolUsdPrice(): Promise<number | null> {
+        try {
+            const res = await axios.get('https://price.jup.ag/v6/price', { params: { ids: 'SOL' }, timeout: 8000 });
+            const price = res.data?.data?.SOL?.price;
+            if (typeof price === 'number' && Number.isFinite(price) && price > 0) return price;
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    private async fetchTokenName(mint: string): Promise<string | null> {
+        try {
+            const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 8000 });
+            const pair = Array.isArray(res.data?.pairs) ? res.data.pairs[0] : null;
+            const tokenName = pair?.baseToken?.name;
+            if (typeof tokenName === 'string' && tokenName.trim().length > 0) return tokenName;
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    private parseIntLike(raw: string): number {
+        const s = raw.replace(/[^0-9]/g, '');
+        const n = Number.parseInt(s || '0', 10);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    private formatCompactUsd(usd: number): string {
+        if (!Number.isFinite(usd) || usd <= 0) return '$0';
+        if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
+        if (usd >= 1_000) return `$${(usd / 1_000).toFixed(1)}K`;
+        return `$${usd.toFixed(0)}`;
+    }
+
+    private computeVolumeEstimateUsd(executionBudgetSol: number, solUsd: number | null, feeRate: number): number {
+        if (!Number.isFinite(executionBudgetSol) || executionBudgetSol <= 0) return 0;
+        if (!solUsd || solUsd <= 0) return 0;
+        if (!Number.isFinite(feeRate) || feeRate <= 0) return 0;
+        const executionBudgetUsd = executionBudgetSol * solUsd;
+        return executionBudgetUsd / (2 * feeRate);
+    }
+
+    private computeWalletPoolSize(executionBudgetLamports: number, desiredWallets: number): number {
+        const minLamportsPerWallet = 2_200_000;
+        if (!Number.isFinite(executionBudgetLamports) || executionBudgetLamports <= 0) return Math.max(1, Math.min(desiredWallets, 6));
+        const maxWallets = Math.floor(executionBudgetLamports / minLamportsPerWallet);
+        return Math.max(1, Math.min(desiredWallets, Math.max(1, maxWallets)));
+    }
+
+    private getDexFeeRate(dex: string): number {
+        const d = (dex || '').toLowerCase();
+        if (d.includes('pump')) return 0.0125;
+        if (d.includes('raydium')) return 0.0025;
+        if (d.includes('meteora')) return 0.0025;
+        return 0.0025;
+    }
+
+    private async deductFeeBeforeExecution(packageSol: number): Promise<void> {
+        const feeLamports = Math.floor(packageSol * 0.4 * LAMPORTS_PER_SOL);
+        if (feeLamports <= 0) return;
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        const messageV0 = new TransactionMessage({
+            payerKey: userKeypair.publicKey,
+            recentBlockhash: blockhash,
+            instructions: [
+                SystemProgram.transfer({
+                    fromPubkey: userKeypair.publicKey,
+                    toPubkey: FEE_VAULT,
+                    lamports: feeLamports,
+                }),
+            ],
+        }).compileToV0Message();
+        const vTxn = new VersionedTransaction(messageV0);
+        vTxn.sign([userKeypair]);
+        const sig = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true, maxRetries: 3, preflightCommitment: 'confirmed' });
+        await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+    }
+
+    private async fetchPoolsFromApi(tokenAddress: string): Promise<PoolInfo[]> {
+        try {
+            const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 10000 });
+            const pairs: any[] = Array.isArray(res.data?.pairs) ? res.data.pairs : [];
+            return pairs.slice(0, 5).map(pair => ({
+                address: typeof pair?.pairAddress === 'string' ? pair.pairAddress : '',
+                dex: typeof pair?.dexId === 'string' ? pair.dexId : 'Unknown',
+                market_cap: this.formatNumber(pair?.marketCap),
+                price: this.formatNumber(pair?.priceUsd),
+                liquidity: this.formatNumber(pair?.liquidity?.usd),
+                url: typeof pair?.url === 'string' ? pair.url : `https://dexscreener.com/solana/${typeof pair?.pairAddress === 'string' ? pair.pairAddress : ''}`,
+            })).filter(p => p.address.length > 0);
+        } catch {
+            return [];
+        }
+    }
+
+    private buildActiveTasksPrompt(chatId: number): string {
+        const task = this.getSelectedTask(chatId);
+        if (!task) {
+            return `🤖 Active tasks for:\n\n🟢 Active tasks: 0\n📈 Volume generated: $0\n\n🧠 Note: please select a task before pausing or adjusting.`;
+        }
+        const tasks = this.getTasks(chatId);
+        const related = tasks.filter(t => t.tokenAddress === task.tokenAddress && t.poolId === task.poolId);
+        const activeCount = related.filter(t => t.status === 'active').length;
+        const totalVolumeUsd = related.reduce((acc, t) => acc + (Number.isFinite(t.volumeUsd) ? t.volumeUsd : 0), 0);
+        return `🤖 Active tasks for:\n\nToken name: ${task.tokenName}\nToken ID: ${task.tokenAddress}\nPool ID: ${task.poolId}\n\n🟢 Active tasks: ${activeCount}\n📈 Volume generated: ${this.formatUsd(totalVolumeUsd)}\n\n🧠 Note: please select a task before pausing or adjusting.`;
+    }
+
+    private async showMainMenu(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'MAIN_MENU';
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
+                [{ text: '🚀 Volume Booster', callback_data: 'volume_booster' }],
                 [
-                    { text: '⚙️ Settings', callback_data: 'settings' },
-                    { text: '📊 Status', callback_data: 'status' }
-                ]
-            ]
+                    { text: '⚡️ Makers Booster', callback_data: 'makers_booster' },
+                    { text: '🛡️ Holders Booster', callback_data: 'holders_booster' },
+                ],
+            ],
         };
+        const caption = `<b>Pegasus Volume Bot</b>\n\n<b>🚀 Volume Booster</b>\nUnmatched volume at the lowest price, with live stats and total control: adjust speed, pause orders, or change CA anytime.\n\n🧪 Other Tools: Makers booster, holders booster.\n\n💧 Supported Platforms: All Solana DEXes and launchpads.\n\n<b>🌐 Official Links:</b>\n<a href="https://www.pegswap.xyz">Website</a> | <a href="https://t.me/PegasusSupportBot">Support</a>`;
+        if (FILE_IDS.start_video) {
+            await this.bot.sendVideo(msg.chat.id, FILE_IDS.start_video, { caption, parse_mode: 'HTML', reply_markup: keyboard });
+            return;
+        }
+        await this.sendMessageWithRetry(msg.chat.id, caption, { parse_mode: 'HTML', reply_markup: keyboard, disable_web_page_preview: true });
+    }
 
-        await this.sendMessageWithRetry(chatId, helpText, {
-            parse_mode: "Markdown",
-            reply_markup: keyboard
+    private async showVolumeBoosterMenu(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_MENU';
+        const keyboard: TelegramBot.InlineKeyboardMarkup = {
+            inline_keyboard: [
+                [{ text: '🆓 Free Trial', callback_data: 'free_trial' }],
+                [{ text: '🚀 Volume Booster', callback_data: 'volume_package_select' }],
+                [{ text: '🟢 Active Tasks', callback_data: 'active_tasks' }, { text: '🔢 Stats', callback_data: 'stats' }],
+                [{ text: '💬 Support', url: SUPPORT_URL }, { text: '👥 Referrals', callback_data: 'referrals' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_main' }],
+            ],
+        };
+        const caption = `<b>🆓 Free Trial:</b>\nTry the mini version of our volume bot for free before ordering.\n\n<b>🚀 Volume Booster:</b>\n• 3 buys + 2 sells from unique wallets executed at the same time.\n• Accurate volume, protected from price drops & MEV bots.\n• Start or pause tasks and change CA anytime.\n\n<b>🟢 Active Tasks</b>\nManage tasks in real time: tweak speed, pause or resume orders, and swap CA for new projects.\n\n<b>🔢 Stats</b>\nTrack live, transparent stats for your volume boosting tasks.\n\n<b>👥 Referrals</b>\nPromote our market-leading volume booster and start earning.`;
+        if (FILE_IDS.volume_booster_image) {
+            await this.bot.sendPhoto(msg.chat.id, FILE_IDS.volume_booster_image, { caption, parse_mode: 'HTML', reply_markup: keyboard });
+            return;
+        }
+        await this.upsertUi(msg, caption, keyboard, 'HTML', true);
+    }
+
+    private async showVolumePackageMenu(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_PACKAGE_SELECT';
+        const packageKey = session.volume_package;
+        const durationKey = session.volume_duration;
+        const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+        const solUsd = await this.getSolUsdPrice();
+        const executionBudgetSol = packageData.sol * 0.6;
+        const executionBudgetLamports = Math.floor(executionBudgetSol * LAMPORTS_PER_SOL);
+        const pumpFeeRate = 0.0125;
+        const rayFeeRate = 0.0025;
+        const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, pumpFeeRate);
+        const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, rayFeeRate);
+        const pumpDesiredWallets = this.parseIntLike(packageData.pump_makers);
+        const rayDesiredWallets = this.parseIntLike(packageData.ray_makers);
+        const pumpWallets = this.computeWalletPoolSize(executionBudgetLamports, pumpDesiredWallets || 6);
+        const rayWallets = this.computeWalletPoolSize(executionBudgetLamports, rayDesiredWallets || 6);
+        const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${this.formatCompactUsd(rayVolumeUsd)}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWallets.toLocaleString()}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${this.formatCompactUsd(pumpVolumeUsd)}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWallets.toLocaleString()}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = {
+            inline_keyboard: [
+                [{ text: '-----Choose Volume-----', callback_data: 'noop' }],
+                [
+                    { text: '🦐 2.5 SOL', callback_data: 'package_2.5' },
+                    { text: '🦐 3.2 SOL', callback_data: 'package_3.2' },
+                    { text: '🐟 4.7 SOL', callback_data: 'package_4.7' },
+                ],
+                [
+                    { text: '🐟 9 SOL', callback_data: 'package_9' },
+                    { text: '🦈 12 SOL', callback_data: 'package_12' },
+                    { text: '🦈 18 SOL', callback_data: 'package_18' },
+                ],
+                [{ text: '🦈 36 SOL', callback_data: 'package_36' }],
+                [{ text: '-----Set Duration-----', callback_data: 'noop' }],
+                [{ text: '💊20min|🟣1h', callback_data: 'duration_20min|1h' }],
+                [
+                    { text: '💊1h|🟣3h', callback_data: 'duration_1h|3h' },
+                    { text: '💊2h|🟣6h', callback_data: 'duration_2h|6h' },
+                    { text: '💊4h|🟣12h', callback_data: 'duration_4h|12h' },
+                ],
+                [
+                    { text: '💊8h|🟣24h', callback_data: 'duration_8h|24h' },
+                    { text: '💊1d|🟣3d', callback_data: 'duration_1d|3d' },
+                    { text: '💊2.5d|🟣7d', callback_data: 'duration_2.5d|7d' },
+                ],
+                [{ text: '✅ Continue', callback_data: 'volume_continue' }],
+                [{ text: '⬅ Back', callback_data: 'back_to_volume_menu' }],
+            ],
+        };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showVolumeOrderSummary(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_ORDER_SUMMARY';
+        const packageKey = session.volume_package;
+        const durationKey = session.volume_duration;
+        const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+        const solUsd = await this.getSolUsdPrice();
+        const executionBudgetSol = packageData.sol * 0.6;
+        const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
+        const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
+        const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${this.formatCompactUsd(rayVolumeUsd)} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${this.formatCompactUsd(pumpVolumeUsd)} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = {
+            inline_keyboard: [
+                [{ text: '✅Continue', callback_data: 'volume_order_confirm' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_volume_packages' }],
+            ],
+        };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showVolumeCaInput(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_CA_INPUT';
+        const text = `📄 <b>Send the contract address of the token you want to increase volume for.</b>\n\n🔽 <i>Please send as a chat message.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back_to_volume_summary' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showVolumePools(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_POOLS_SELECT';
+        const ca = session.volume_ca;
+        if (!ca) {
+            await this.showVolumeCaInput(msg);
+            return;
+        }
+        const pools = await this.fetchPoolsFromApi(ca);
+        session.volume_pools = pools;
+        if (pools.length === 0) {
+            const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back_to_volume_ca' }]] };
+            await this.upsertUi(msg, '❌ No pools found. Please try again.', keyboard, 'HTML', true);
+            return;
+        }
+        let text = `<b>💧 Select the liquidity pool you want to use:</b>\n\n`;
+        const keyboardRows: TelegramBot.InlineKeyboardButton[][] = [];
+        pools.slice(0, 5).forEach((pool, idx) => {
+            const i = idx + 1;
+            text += `<b>-${i}-</b>\n💧 <b>LP Type:</b> ${pool.dex}\n📄 <b>Pool address:</b> ${pool.address}\n📊 <b>Market cap: $${pool.market_cap}</b>\n💵 <b>Price: $${pool.price}</b>\n💦 <b>Liquidity: $${pool.liquidity}</b>\n👀 <b>Chart:</b> <a href='${pool.url}'>View on Dexscreener</a>\n\n`;
+            const truncated = pool.address.length > 16 ? `${pool.address.slice(0, 8)}…${pool.address.slice(-8)}` : pool.address;
+            keyboardRows.push([{ text: `${i}. ${truncated}`, callback_data: `volume_pool_${i}` }]);
         });
+        keyboardRows.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_ca' }]);
+        await this.upsertUi(msg, text, { inline_keyboard: keyboardRows }, 'HTML', true);
     }
 
-    private async _handleSettingsLogic(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        const tokenDisplay = this.config.tokenAddress
-            ? `${this.config.tokenAddress.substring(0, 6)}...${this.config.tokenAddress.substring(this.config.tokenAddress.length - 4)}`
-            : 'Not Set';
+    private async showVolumeReviewSummary(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_REVIEW_SUMMARY';
+        const pool = session.volume_selected_pool;
+        if (!session.volume_ca || !pool) {
+            await this.showVolumePools(msg);
+            return;
+        }
+        const packageKey = session.volume_package;
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+        const text = `<b>📋 Review your order summary:</b>\n\n📄 Token address:\n<b>${session.volume_ca}</b>\n\n💧 Pool address:\n<b>${pool.address}</b>\n\n📦 <b>Package: ${packageKey} SOL (${packageData.tasks} tasks)</b>\n\n💸 Total to pay: <b>${packageData.sol} SOL</b>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Pay Order', callback_data: 'volume_payment' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_pools' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
 
+    private async showVolumePayment(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_PAYMENT';
+        const packageKey = session.volume_package;
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+        session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        if (session.paymentStartBalanceLamports === undefined) {
+            try {
+                session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+            } catch {
+                session.paymentStartBalanceLamports = undefined;
+            }
+        }
+        const address = userKeypair.publicKey.toBase58();
+        const text = `💸 <b>Pay for your order and start your volume-growth journey!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showFreeTrialEntry(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'FREE_TRIAL_CA';
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]] };
+        const caption = `<b>📄 Send the contract address of the token you want to increase volume for.</b>\n\n<i>🔽 Please send as a chat message.</i>`;
+        if (FILE_IDS.free_trial_image) {
+            await this.bot.sendPhoto(msg.chat.id, FILE_IDS.free_trial_image, { caption, parse_mode: 'HTML', reply_markup: keyboard });
+            return;
+        }
+        await this.upsertUi(msg, caption, keyboard, 'HTML', true);
+    }
+
+    private async showFreeTrialPools(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'FREE_TRIAL_POOLS';
+        const ca = session.free_trial_ca;
+        if (!ca) {
+            await this.showFreeTrialEntry(msg);
+            return;
+        }
+        const pools = await this.fetchPoolsFromApi(ca);
+        session.free_trial_pools = pools;
+        if (pools.length === 0) {
+            const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back_to_free_trial' }]] };
+            await this.upsertUi(msg, '❌ No pools found. Please try again.', keyboard, 'HTML', true);
+            return;
+        }
+        let text = `<b>💧 Select the liquidity pool you want to use:</b>\n\n`;
+        const keyboardRows: TelegramBot.InlineKeyboardButton[][] = [];
+        pools.slice(0, 5).forEach((pool, idx) => {
+            const i = idx + 1;
+            text += `<b>-${i}-</b>\n💧 <b>LP Type:</b> ${pool.dex}\n📄 <b>Pool address:</b> ${pool.address}\n📊 <b>Market cap: $${pool.market_cap}</b>\n💵 <b>Price: $${pool.price}</b>\n💦 <b>Liquidity: $${pool.liquidity}</b>\n👀 <b>Chart:</b> <a href='${pool.url}'>View on Dexscreener</a>\n\n`;
+            const truncated = pool.address.length > 16 ? `${pool.address.slice(0, 8)}…${pool.address.slice(-8)}` : pool.address;
+            keyboardRows.push([{ text: `${i}. ${truncated}`, callback_data: `free_pool_${i}` }]);
+        });
+        keyboardRows.push([{ text: '⬅️ Back', callback_data: 'back_to_free_trial' }]);
+        await this.upsertUi(msg, text, { inline_keyboard: keyboardRows }, 'HTML', true);
+    }
+
+    private async showFreeTrialSummary(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'FREE_TRIAL_SUMMARY';
+        const ca = session.free_trial_ca;
+        const pool = session.free_trial_selected_pool;
+        if (!ca || !pool) {
+            await this.showFreeTrialPools(msg);
+            return;
+        }
+        const text = `<b>📋 Review your order summary:</b>\n\n<b>📄 Token address:</b>\n${ca}\n\n<b>💧 Liquidity Pool:</b>\n${pool.address}`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅Continue', callback_data: 'start_free_trial' }], [{ text: '⬅️ Back', callback_data: 'back_to_free_pools' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showActiveTasks(msg: TelegramBot.Message) {
+        const chatId = msg.chat.id;
+        const session = this.getSession(chatId);
+        session.flow = 'ACTIVE_TASKS';
+        const selected = this.getSelectedTask(chatId);
+        const hasActiveTask = this.getTasks(chatId).some(t => t.status === 'active');
+        const baseKeyboard: TelegramBot.InlineKeyboardButton[][] = [
+            [{ text: '🔄 Refresh', callback_data: 'refresh_tasks' }, { text: '🔴 View Stopped Tasks', callback_data: 'view_stopped' }],
+        ];
+        if (!selected) {
+            baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
+            const text = '❌ No active volume tasks found. Please create a new task first.';
+            if (FILE_IDS.active_tasks_image) {
+                await this.bot.sendPhoto(chatId, FILE_IDS.active_tasks_image, { caption: text, reply_markup: { inline_keyboard: baseKeyboard } });
+                return;
+            }
+            await this.upsertUi(msg, text, { inline_keyboard: baseKeyboard }, undefined, true);
+            return;
+        }
+        if (hasActiveTask) baseKeyboard.push([{ text: `⏱️ Sleep (${session.sleepMs}ms)`, callback_data: 'set_time' }]);
+        if (selected.status === 'active') baseKeyboard.push([{ text: '⏸ Pause Task', callback_data: 'pause_task' }]);
+        if (selected && selected.status === 'paused') {
+            baseKeyboard.push([{ text: '▶️ Resume Task', callback_data: 'resume_task' }]);
+        }
+        baseKeyboard.push([{ text: '🔁 Change CA', callback_data: 'set_token' }, { text: '🎯 Trial Buy', callback_data: 'trial_buy' }]);
+        if (selected && selected.status !== 'stopped') {
+            baseKeyboard.push([{ text: '⏹ Stop Task', callback_data: 'stop_task' }]);
+        }
+        if (this.isPrivilegedUser(msg.from?.id)) {
+            baseKeyboard.push([{ text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' }, { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' }]);
+        }
+        baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
+
+        const text = this.buildActiveTasksPrompt(chatId);
+        if (FILE_IDS.active_tasks_image) {
+            await this.bot.sendPhoto(chatId, FILE_IDS.active_tasks_image, { caption: text, reply_markup: { inline_keyboard: baseKeyboard } });
+            return;
+        }
+        await this.upsertUi(msg, text, { inline_keyboard: baseKeyboard }, undefined, true);
+    }
+
+    private async showStoppedTasks(msg: TelegramBot.Message) {
+        const chatId = msg.chat.id;
+        const session = this.getSession(chatId);
+        session.flow = 'STOPPED_TASKS';
+        const tasks = this.getTasks(chatId).filter(t => t.status === 'paused' || t.status === 'stopped');
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
-                [
-                    { text: `💰 SOL/Swap: ${this.config.solAmount.toFixed(4)}`, callback_data: 'set_sol' },
-                    { text: `💧 Slippage: ${(this.config.slippage * 100).toFixed(1)}%`, callback_data: 'set_slippage' },
-                ],
-                [{ text: `🔑 Token: ${tokenDisplay}`, callback_data: 'set_token' }],
-                [{ text: `⏱️ Sleep: ${this.config.sleepTime}ms`, callback_data: 'set_time' }],
-                [
-                    { text: this.config.isRunning ? '⏹️ Bot Running (Stop)' : '▶️ Bot Stopped (Start)', callback_data: this.config.isRunning ? 'stop_bot_op' : 'start_bot_op' },
-                ],
-                [
-                    { text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' },
-                    { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' },
-                ],
-                [
-                    { text: '❓ Help', callback_data: 'help' },
-                    { text: '📊 Status', callback_data: 'status' }
-                ]
-            ]
+                [{ text: '🔄 Refresh', callback_data: 'refresh_stopped' }, { text: '🟢View Active Tasks', callback_data: 'back_to_active_tasks' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }],
+            ],
         };
-        const messageText = this.config.isRunning
-            ? '⚙️ **Bot Settings (Currently RUNNING)** ⚙️'
-            : '⚙️ **Bot Settings (Currently STOPPED)** ⚙️';
-
-        try {
-            if ('message_id' in msg && this.bot && typeof this.bot.editMessageText === 'function') {
-                try {
-                    await this.editMessageWithRetry(chatId, msg.message_id, messageText, {
-                        parse_mode: "Markdown",
-                        reply_markup: keyboard,
-                    });
-                } catch (e: any) {
-                    if (e.message && e.message.includes("message can't be edited")) {
-                        // If message can't be edited, send a new one
-                        await this.sendMessageWithRetry(chatId, messageText, {
-                            reply_markup: keyboard,
-                            parse_mode: "Markdown"
-                        });
-                    } else {
-                        console.error("Error editing settings message:", e);
-                        // Send a new message as fallback
-                        await this.sendMessageWithRetry(chatId, messageText, {
-                            reply_markup: keyboard,
-                            parse_mode: "Markdown"
-                        });
-                    }
-                }
-            } else {
-                await this.sendMessageWithRetry(chatId, messageText, { reply_markup: keyboard, parse_mode: "Markdown" });
-            }
-        } catch (error) {
-            console.error("Error in settings logic:", error);
-            // Final fallback - send a simple message
-            await this.sendMessageWithRetry(chatId, "Error updating settings. Please try /settings again.");
+        if (tasks.length === 0) {
+            await this.upsertUi(msg, 'No paused/stopped tasks.', keyboard, 'HTML', true);
+            return;
         }
+        const lines = tasks.slice(0, 10).map((t, i) => `${i + 1}. ${t.tokenName} (${t.status}) - ${this.formatUsd(t.volumeUsd)}`);
+        const text = `Stopped tasks:\n\n${lines.join('\n')}`;
+        await this.upsertUi(msg, text, keyboard, 'Markdown', true);
     }
 
-    private async handleCallbackQuery(callbackQuery: TelegramBot.CallbackQuery) {
-        const chatId = callbackQuery.message?.chat.id;
-        const userId = callbackQuery.from.id;
-        const originalMessage = callbackQuery.message;
-
-        if (!chatId || !originalMessage) {
-            console.error("Callback query without chat ID or message:", callbackQuery);
-            if (callbackQuery.id) await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Error: Message context missing." });
-            return;
-        }
-        if (!this.isUserAllowed(userId)) {
-            await this.bot.answerCallbackQuery(callbackQuery.id, { text: "🚫 Unauthorized" });
-            await this.sendMessageWithRetry(chatId, "🚫 You are not authorized for this action.");
-            console.log(`Unauthorized callback query by user ID: ${userId}, data: ${callbackQuery.data}`);
-            return;
-        }
-
-        const data = callbackQuery.data;
-        if (!data) {
-            await this.bot.answerCallbackQuery(callbackQuery.id);
-            return;
-        }
-
-        await this.bot.answerCallbackQuery(callbackQuery.id);
-
-        try {
-            let requiresSettingsUpdate = false;
-            switch (data) {
-                case 'settings':
-                    await this._handleSettingsLogic(originalMessage);
-                    break;
-                case 'help':
-                    await this._handleHelpLogic(originalMessage);
-                    break;
-                case 'status':
-                    await this._handleStatusLogic(originalMessage);
-                    break;
-                case 'set_sol':
-                    await this.sendMessageWithRetry(chatId, 'Enter SOL amount per sub-wallet (e.g., 0.005):');
-                    this.bot.once('message', async (responseMsg) => {
-                        if (responseMsg.chat.id === chatId && this.isUserAllowed(responseMsg.from?.id)) {
-                            const amount = parseFloat(responseMsg.text || '');
-                            if (!isNaN(amount) && amount > 0.004 && amount < 10) {
-                                this.config.solAmount = amount;
-                                await this.sendMessageWithRetry(chatId, `✅ SOL amount set to ${amount}`);
-                            } else {
-                                await this.sendMessageWithRetry(chatId, '❌ Invalid amount. (e.g. 0.005,  min 0.004 And max 10).');
-                            }
-                            await this._handleSettingsLogic(originalMessage);
-                        }
-                    });
-                    break;
-
-                case 'set_slippage':
-                    await this.sendMessageWithRetry(chatId, 'Enter slippage % (e.g., 0.5 for 0.5%, max 50%):');
-                    this.bot.once('message', async (responseMsg) => {
-                        if (responseMsg.chat.id === chatId && this.isUserAllowed(responseMsg.from?.id)) {
-                            const percentage = parseFloat(responseMsg.text || '');
-                            if (!isNaN(percentage) && percentage >= 0.1 && percentage <= 50) {
-                                this.config.slippage = percentage / 100;
-                                await this.sendMessageWithRetry(chatId, `✅ Slippage set to ${percentage}%`);
-                            } else {
-                                await this.sendMessageWithRetry(chatId, '❌ Invalid slippage. Enter between 0.1 and 50.');
-                            }
-                            await this._handleSettingsLogic(originalMessage);
-                        }
-                    });
-                    break;
-
-                case 'set_token':
-                    await this.sendMessageWithRetry(chatId, 'Enter the Pump.fun token address:');
-                    this.bot.once('message', async (responseMsg) => {
-                        if (responseMsg.chat.id === chatId && this.isUserAllowed(responseMsg.from?.id)) {
-                            const tokenAddress = responseMsg.text?.trim();
-                            if (tokenAddress && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(tokenAddress)) {
-                                await this.sendMessageWithRetry(chatId, `⏳ Validating token ...`);
-                                try {
-                                    const tempBot = new PumpfunVbot(tokenAddress, 0, 0);
-                                    await tempBot.getPumpData();
-                                    this.config.tokenAddress = tokenAddress;
-                                    await this.sendMessageWithRetry(chatId, `✅ Token: ${tokenAddress}\n  SOL: ${(tempBot.virtualSolReserves / LAMPORTS_PER_SOL).toFixed(6)}\n  Tokens: ${tempBot.virtualTokenReserves?.toLocaleString() || '0'}`);
-                                } catch (error: any) {
-                                    console.error("Token validation error:", error);
-                                    await this.sendMessageWithRetry(chatId, `❌ Invalid or non-Pump.fun token: ${error.message || 'Unknown validation error.'}`);
-                                }
-                            } else {
-                                await this.sendMessageWithRetry(chatId, '❌ Invalid token address format.');
-                            }
-                            await this._handleSettingsLogic(originalMessage);
-                        }
-                    });
-                    break;
-
-                case 'set_time':
-                    await this.sendMessageWithRetry(chatId, 'Enter sleep time in milliseconds (e.g., 3000, min 1000ms):');
-                    this.bot.once('message', async (responseMsg) => {
-                        if (responseMsg.chat.id === chatId && this.isUserAllowed(responseMsg.from?.id)) {
-                            const time = parseInt(responseMsg.text || '');
-                            if (!isNaN(time) && time >= 1000) {
-                                this.config.sleepTime = time;
-                                await this.sendMessageWithRetry(chatId, `✅ Sleep time set to ${time}ms`);
-                            } else {
-                                await this.sendMessageWithRetry(chatId, '❌ Invalid time. Enter a number >= 1000.');
-                            }
-                            await this._handleSettingsLogic(originalMessage);
-                        }
-                    });
-                    break;
-
-                case 'start_bot_op':
-                    await this._startBotLogic(originalMessage);
-                    requiresSettingsUpdate = true;
-                    break;
-
-                case 'stop_bot_op':
-                    await this._stopBotLogic(originalMessage);
-                    requiresSettingsUpdate = true;
-                    break;
-
-                case 'sell_all_tokens':
-                    await this.sellAllTokens(originalMessage);
-                    break;
-
-                case 'collect_all_sol':
-                    await this.collectAllSol(originalMessage);
-                    break;
-            }
-            if (requiresSettingsUpdate) {
-                await this._handleSettingsLogic(originalMessage);
-            }
-        } catch (error) {
-            console.error(`Error in callback query handler (data: ${data}):`, error);
-            await this.sendMessageWithRetry(chatId, "🤖 An error occurred while processing your request.");
-        }
-    }
-
-    private async _startBotLogic(msg: TelegramBot.Message) {
+    private async showStats(msg: TelegramBot.Message) {
         const chatId = msg.chat.id;
+        const session = this.getSession(chatId);
+        session.flow = 'STATS';
+        const tasks = this.getTasks(chatId);
+        const totalVolumeUsd = tasks.reduce((acc, t) => acc + (Number.isFinite(t.volumeUsd) ? t.volumeUsd : 0), 0);
+        const totalTasks = tasks.length;
+        const text = `🔢 <b>Total stats:</b>\n\n🤖 Volume boost tasks executed: <b>${totalTasks}</b>\n📈 Volume generated: <b>${this.formatUsd(totalVolumeUsd)}</b>\n⚡️ Makers delivered: <b>0</b>\n👛 Wallets used: <b>0</b>\n\n🔽 <i>Start your first volume boost task to improve your token!</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '🚀 Boost Volume', callback_data: 'boost_volume' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]] };
+        if (FILE_IDS.stats_image) {
+            await this.bot.sendPhoto(chatId, FILE_IDS.stats_image, { caption: text, parse_mode: 'HTML', reply_markup: keyboard });
+            return;
+        }
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
 
-        if (this.config.isRunning) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Bot is already running!');
+    private async showReferrals(msg: TelegramBot.Message) {
+        const chatId = msg.chat.id;
+        const session = this.getSession(chatId);
+        session.flow = 'REFERRALS';
+        const text = `👛 Please share your Solana (SOL) wallet address to receive your referral cut from purchases made through your referral link.\n\nℹ️ Note: referral activation may take up to 24 hours. Please check your referral link status in the next step.\n\n🔽 <i>Please send your wallet address as a chat message.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '🧠 Docs', url: 'https://chartup.gitbook.io/docs/' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]] };
+        if (FILE_IDS.referrals_image) {
+            await this.bot.sendPhoto(chatId, FILE_IDS.referrals_image, { caption: text, parse_mode: 'HTML', reply_markup: keyboard });
             return;
         }
-        if (!this.config.tokenAddress || (this.config.tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Token address not set or is placeholder. Configure in /settings.');
-            return;
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async pauseTask(chatId: number) {
+        const task = this.getSelectedTask(chatId);
+        if (!task || task.status !== 'active') return;
+        task.status = 'paused';
+        this.upsertTask(chatId, task);
+    }
+
+    private async resumeTask(chatId: number) {
+        const task = this.getSelectedTask(chatId);
+        if (!task || task.status !== 'paused') return;
+        task.status = 'active';
+        this.upsertTask(chatId, task);
+        await this.startRuntimeForTask(chatId, task);
+    }
+
+    private async stopTask(chatId: number) {
+        const task = this.getSelectedTask(chatId);
+        if (!task || task.status === 'stopped') return;
+        task.status = 'stopped';
+        this.upsertTask(chatId, task);
+    }
+
+    private async collectAllSol(chatId: number) {
+        const session = this.getSession(chatId);
+        if (this.getTasks(chatId).some(t => t.status === 'active')) return;
+        const selected = this.getSelectedTask(chatId);
+        const tokenAddress = selected?.tokenAddress ?? DefaultCA;
+        if (!tokenAddress || (tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) return;
+        if (!session.pumpBot) {
+            session.pumpBot = new PumpfunVbot(tokenAddress, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         }
-        if (this.config.solAmount <= 0) {
-            await this.sendMessageWithRetry(chatId, '⚠️ SOL Amount per swap not set or invalid. Configure in /settings.');
-            return;
+        if (!session.pumpBot.keypairs || session.pumpBot.keypairs.length === 0) {
+            if (!fs.existsSync('wallets.json')) return;
+            session.pumpBot.loadWallets();
         }
-        if (this.config.slippage <= 0 || this.config.slippage > 0.5) {
-            await this.sendMessageWithRetry(chatId, `⚠️ Slippage is ${(this.config.slippage * 100).toFixed(1)}%. Must be > 0% and <= 50%. Configure in /settings.`);
-            return;
+        if (!session.pumpBot.lookupTableAccount) {
+            if (!fs.existsSync('./lut.json')) return;
+            await session.pumpBot.loadLUT();
+            if (!session.pumpBot.lookupTableAccount) return;
+        }
+        await session.pumpBot.collectSOL();
+    }
+
+    private async sellAllTokens(chatId: number) {
+        const session = this.getSession(chatId);
+        if (this.getTasks(chatId).some(t => t.status === 'active')) return;
+        const selected = this.getSelectedTask(chatId);
+        const tokenAddress = selected?.tokenAddress ?? DefaultCA;
+        if (!tokenAddress || (tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) return;
+        session.pumpBot = new PumpfunVbot(tokenAddress, 0, session.slippage);
+        await session.pumpBot.getPumpData();
+        if (!fs.existsSync('wallets.json')) return;
+        session.pumpBot.loadWallets();
+        if (!fs.existsSync('./lut.json')) return;
+        await session.pumpBot.loadLUT();
+        if (!session.pumpBot.lookupTableAccount) return;
+        await session.pumpBot.sellAllTokensFromWallets();
+    }
+
+    private async trialBuy(chatId: number, tokenAddress: string, poolId: string) {
+        const session = this.getSession(chatId);
+        if (this.getTasks(chatId).some(t => t.status === 'active')) return;
+        const tokenName = (await this.fetchTokenName(tokenAddress)) ?? tokenAddress;
+        const trialBot = new PumpfunVbot(tokenAddress, Math.floor(0.05 * LAMPORTS_PER_SOL), session.slippage);
+        await trialBot.getPumpData();
+        const desiredWallets = 6;
+        if (!fs.existsSync('wallets.json')) trialBot.createWallets(desiredWallets);
+        trialBot.loadWallets(desiredWallets);
+        if (!fs.existsSync('./lut.json')) {
+            await trialBot.createLUT();
+        } else {
+            await trialBot.loadLUT();
+            if (!trialBot.lookupTableAccount) await trialBot.createLUT();
+        }
+        await trialBot.extendLUT();
+        await trialBot.distributeSOL();
+        const cycleVolumeLamports = await trialBot.swap();
+        const solUsd = await this.getSolUsdPrice();
+        const volumeUsd = solUsd ? (cycleVolumeLamports / LAMPORTS_PER_SOL) * solUsd : 0;
+        const task: VolumeTask = {
+            id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+            status: 'stopped',
+            tokenAddress,
+            tokenName,
+            poolId,
+            poolDex: session.free_trial_selected_pool?.dex ?? 'pumpfun',
+            walletPoolSize: desiredWallets,
+            walletsUsed: 0,
+            startedAtMs: Date.now(),
+            endsAtMs: null,
+            volumeLamports: cycleVolumeLamports,
+            volumeUsd,
+            swapCycles: 1,
+            packageKey: null,
+            durationKey: null,
+            phase: 'pump',
+            phaseStartedAtMs: Date.now(),
+            phaseVolumeUsd: volumeUsd,
+            pumpTargetUsd: volumeUsd,
+            pumpDurationMs: 0,
+            rayTargetUsd: 0,
+            rayDurationMs: 0,
+            pumpBuyMinSol: 0,
+            pumpBuyMaxSol: 0,
+            rayBuyMinSol: 0,
+            rayBuyMaxSol: 0,
+            cycleIntervalMs: session.sleepMs,
+            remainingBudgetLamports: 0,
+            walletCooldownMs: 0,
+        };
+        this.upsertTask(chatId, task);
+    }
+
+    private async startRuntimeForTask(chatId: number, task: VolumeTask) {
+        const session = this.getSession(chatId);
+        const existingBot = this.botsByTaskId.get(task.id);
+        const bot = existingBot ?? new PumpfunVbot(task.tokenAddress, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
+        if (!existingBot) this.botsByTaskId.set(task.id, bot);
+
+        if (!bot.keypairs || bot.keypairs.length === 0) {
+            if (!fs.existsSync('wallets.json')) bot.createWallets();
+            bot.loadWallets();
         }
 
-        try {
-            const mainWalletBalance = await connection.getBalance(userKeypair.publicKey);
-            const numWalletsToFund = 10;
-            const estimatedCost = (0.02 * LAMPORTS_PER_SOL) + (this.config.solAmount * numWalletsToFund * LAMPORTS_PER_SOL) + (DefaultJitoTipAmountLamports * 5);
-            if (mainWalletBalance < estimatedCost) {
-                await this.sendMessageWithRetry(chatId, `⚠️ Insufficient main wallet balance. Need ~${(estimatedCost / LAMPORTS_PER_SOL).toFixed(4)} SOL for setup and initial distribution. Current: ${(mainWalletBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL.`);
-                return;
+        if (!bot.lookupTableAccount) {
+            if (fs.existsSync('./lut.json')) {
+                await bot.loadLUT();
             }
-
-            this.config.isRunning = true;
-            await this.sendMessageWithRetry(chatId, '🚀 Initializing bot operations...');
-
-            this.pumpBot = new PumpfunVbot(
-                this.config.tokenAddress,
-                this.config.solAmount * LAMPORTS_PER_SOL,
-                this.config.slippage
-            );
-
-            await this.sendMessageWithRetry(chatId, 'Fetching token data...');
-            await this.pumpBot.getPumpData();
-            await this.sendMessageWithRetry(chatId, `✅ Token: ${this.config.tokenAddress.substring(0, 6)}... | SOL: ${(this.pumpBot.virtualSolReserves / LAMPORTS_PER_SOL).toFixed(4)} | Tokens: ${this.pumpBot.virtualTokenReserves.toLocaleString()}`);
-
-            if (!fs.existsSync('wallets.json')) {
-                await this.sendMessageWithRetry(chatId, 'wallets.json not found. Creating new wallets...');
-                this.pumpBot.createWallets();
+            if (!bot.lookupTableAccount) {
+                await bot.createLUT();
             }
-            this.pumpBot.loadWallets();
-            await this.sendMessageWithRetry(chatId, `✅ Loaded ${this.pumpBot.keypairs.length} wallets.`);
+        }
 
-            if (!fs.existsSync('./lut.json')) {
-                await this.sendMessageWithRetry(chatId, 'LUT.json not found. Creating new Lookup Table (can take ~30s)...');
-                await this.pumpBot.createLUT();
-                await this.sendMessageWithRetry(chatId, '✅ New LUT created.');
-            } else {
-                await this.pumpBot.loadLUT();
-                if (!this.pumpBot.lookupTableAccount) {
-                    await this.sendMessageWithRetry(chatId, 'Failed to load LUT from file, attempting to create a new one (can take ~30s)...');
-                    await this.pumpBot.createLUT();
-                    //await this.sendMessageWithRetry(chatId, '✅ New LUT created after load failure.');
+        if (!bot.bondingCurve || !bot.associatedBondingCurve) {
+            await bot.getPumpData();
+        }
+
+        (async () => {
+            const botAny = bot as any;
+            if (!botAny.__walletMeta) {
+                botAny.__walletMeta = new Map<string, { solLamports: number | null; tokenAmount: bigint | null; lastBuyMs: number; lastSellMs: number }>();
+            }
+            const walletMeta: Map<string, { solLamports: number | null; tokenAmount: bigint | null; lastBuyMs: number; lastSellMs: number }> = botAny.__walletMeta;
+
+            const ensureMeta = (walletPubkeyBase58: string) => {
+                const existing = walletMeta.get(walletPubkeyBase58);
+                if (existing) return existing;
+                const fresh = { solLamports: null, tokenAmount: null, lastBuyMs: 0, lastSellMs: 0 };
+                walletMeta.set(walletPubkeyBase58, fresh);
+                return fresh;
+            };
+
+            const refreshSolBalance = async (walletPubkeyBase58: string, pubkey: any) => {
+                const meta = ensureMeta(walletPubkeyBase58);
+                if (meta.solLamports !== null) return meta.solLamports;
+                const bal = await connection.getBalance(pubkey, 'confirmed');
+                meta.solLamports = bal;
+                return bal;
+            };
+
+            const refreshTokenBalance = async (walletPubkeyBase58: string, pubkey: any) => {
+                const meta = ensureMeta(walletPubkeyBase58);
+                if (meta.tokenAmount !== null) return meta.tokenAmount;
+                const bal = await bot.getTokenBalance(pubkey);
+                meta.tokenAmount = bal;
+                return bal;
+            };
+
+            const pickBuyWallet = async (tradeLamports: number, cooldownMs: number, nowMs: number) => {
+                const wallets = bot.keypairs ?? [];
+                const candidates: any[] = [];
+                for (const w of wallets) {
+                    const id = w.publicKey.toBase58();
+                    const meta = ensureMeta(id);
+                    if (nowMs - meta.lastBuyMs < cooldownMs) continue;
+                    const solLamports = await refreshSolBalance(id, w.publicKey);
+                    if (solLamports >= tradeLamports + 20000) candidates.push(w);
+                }
+                if (candidates.length === 0) return null;
+                candidates.sort((a, b) => ensureMeta(a.publicKey.toBase58()).lastBuyMs - ensureMeta(b.publicKey.toBase58()).lastBuyMs);
+                const pickFrom = candidates.slice(0, Math.min(5, candidates.length));
+                return pickFrom[Math.floor(Math.random() * pickFrom.length)];
+            };
+
+            const pickSellWallet = async (cooldownMs: number, nowMs: number) => {
+                const wallets = bot.keypairs ?? [];
+                const candidates: any[] = [];
+                for (const w of wallets) {
+                    const id = w.publicKey.toBase58();
+                    const meta = ensureMeta(id);
+                    if (nowMs - meta.lastSellMs < cooldownMs) continue;
+                    const tokenBal = await refreshTokenBalance(id, w.publicKey);
+                    if (tokenBal > 0n) candidates.push(w);
+                }
+                if (candidates.length === 0) return null;
+                candidates.sort((a, b) => {
+                    const am = ensureMeta(a.publicKey.toBase58()).lastSellMs;
+                    const bm = ensureMeta(b.publicKey.toBase58()).lastSellMs;
+                    return am - bm;
+                });
+                const pickFrom = candidates.slice(0, Math.min(5, candidates.length));
+                return pickFrom[Math.floor(Math.random() * pickFrom.length)];
+            };
+
+            const cyclePattern: Array<'buy' | 'sell'> = ['buy', 'buy', 'buy', 'sell', 'sell'];
+            const reserveLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
+
+            while (true) {
+                const current = this.getTasks(chatId).find(t => t.id === task.id);
+                if (!current || current.status !== 'active') break;
+                const nowMs = Date.now();
+                if (current.endsAtMs && nowMs >= current.endsAtMs) {
+                    current.status = 'stopped';
+                    this.upsertTask(chatId, current);
+                    break;
+                }
+
+                const phaseTargetUsd = current.phase === 'pump' ? current.pumpTargetUsd : current.rayTargetUsd;
+                const phaseDurationMs = current.phase === 'pump' ? current.pumpDurationMs : current.rayDurationMs;
+                const phaseElapsedMs = nowMs - current.phaseStartedAtMs;
+
+                if (phaseDurationMs > 0 && phaseElapsedMs >= phaseDurationMs) {
+                    if (current.phase === 'pump') {
+                        current.phase = 'ray';
+                        current.phaseStartedAtMs = nowMs;
+                        current.phaseVolumeUsd = 0;
+                        this.upsertTask(chatId, current);
+                        continue;
+                    }
+                    current.status = 'stopped';
+                    this.upsertTask(chatId, current);
+                    break;
+                }
+
+                if (phaseTargetUsd > 0 && current.phaseVolumeUsd >= phaseTargetUsd) {
+                    if (current.phase === 'pump') {
+                        current.phase = 'ray';
+                        current.phaseStartedAtMs = nowMs;
+                        current.phaseVolumeUsd = 0;
+                        this.upsertTask(chatId, current);
+                        continue;
+                    }
+                    current.status = 'stopped';
+                    this.upsertTask(chatId, current);
+                    break;
+                }
+
+                if (current.remainingBudgetLamports <= reserveLamports) {
+                    current.status = 'stopped';
+                    this.upsertTask(chatId, current);
+                    break;
+                }
+
+                const solUsd = await this.getSolUsdPrice();
+                const safeSolUsd = solUsd && solUsd > 0 ? solUsd : 0;
+                const remainingPhaseUsd = Math.max(0, phaseTargetUsd - current.phaseVolumeUsd);
+                const remainingPhaseTimeMs = Math.max(0, phaseDurationMs - phaseElapsedMs);
+
+                let tradeSizeSol = 0;
+                if (current.phase === 'pump') {
+                    const base = this.randomBetween(current.pumpBuyMinSol, current.pumpBuyMaxSol);
+                    let mult = 1;
+                    if (phaseDurationMs > 0 && phaseTargetUsd > 0) {
+                        const expectedByNow = (phaseTargetUsd * phaseElapsedMs) / phaseDurationMs;
+                        if (current.phaseVolumeUsd < expectedByNow * 0.9) mult = 1.2;
+                        if (current.phaseVolumeUsd > expectedByNow * 1.1) mult = 0.8;
+                    }
+                    tradeSizeSol = this.clamp(base * mult, current.pumpBuyMinSol, current.pumpBuyMaxSol);
                 } else {
-                    //await this.sendMessageWithRetry(chatId, '✅ Existing LUT loaded.');
+                    const expectedCycles = current.cycleIntervalMs > 0 ? remainingPhaseTimeMs / current.cycleIntervalMs : 1;
+                    const tradesLeft = Math.max(1, Math.floor(expectedCycles * cyclePattern.length));
+                    const idealUsd = tradesLeft > 0 ? remainingPhaseUsd / tradesLeft : remainingPhaseUsd;
+                    const idealSol = safeSolUsd > 0 ? idealUsd / safeSolUsd : this.randomBetween(current.rayBuyMinSol, current.rayBuyMaxSol);
+                    const randomized = idealSol * this.randomBetween(0.8, 1.2);
+                    tradeSizeSol = this.clamp(randomized, current.rayBuyMinSol, current.rayBuyMaxSol);
                 }
-            }
 
-            //await this.sendMessageWithRetry(chatId, 'Extending Lookup Table if necessary (can take ~30s per transaction)...');
-            await this.pumpBot.extendLUT();
-            // await this.sendMessageWithRetry(chatId, '✅ LUT extension process complete.');
+                let tradeLamports = Math.floor(tradeSizeSol * LAMPORTS_PER_SOL);
+                tradeLamports = Math.max(0, Math.min(tradeLamports, Math.max(0, current.remainingBudgetLamports - reserveLamports)));
+                if (tradeLamports <= 0) {
+                    await new Promise(resolve => setTimeout(resolve, current.cycleIntervalMs));
+                    continue;
+                }
 
-            // await this.sendMessageWithRetry(chatId, `Distributing ${this.config.solAmount} SOL to each sub-wallet...`);
-            await this.pumpBot.distributeSOL();
-            await this.sendMessageWithRetry(chatId, '✅ SOL distribution complete.');
+                const cooldownMs = Math.max(500, current.walletCooldownMs);
+                let executedTrades = 0;
 
-            await this.sendMessageWithRetry(chatId, `🔄 Starting swap operations. Sleep time: ${this.config.sleepTime}ms. Slippage: ${(this.config.slippage * 100).toFixed(1)}%`);
+                for (const action of cyclePattern) {
+                    const updated = this.getTasks(chatId).find(t => t.id === task.id);
+                    if (!updated || updated.status !== 'active') break;
 
-            (async () => {
-                while (this.config.isRunning && this.pumpBot) {
-                    try {
-                        // if(!this.pumpBot)
-                        // return;
-                        await this.pumpBot.swap();
-                        await this.sendMessageWithRetry(chatId, `Cycle complete. Sleeping for ${this.config.sleepTime / 1000}s...`);
-                        await new Promise(resolve => setTimeout(resolve, this.config.sleepTime));
-                    } catch (loopError: any) {
-                        console.error("Error in swap loop:", loopError);
-                        await this.sendMessageWithRetry(chatId, `⚠️ Error during swap cycle: ${loopError.message}. Check console. Pausing for 10s.`);
-                        await new Promise(resolve => setTimeout(resolve, 10000));
+                    const tradeNowMs = Date.now();
+                    if (updated.remainingBudgetLamports <= reserveLamports) break;
+
+                    if (action === 'buy') {
+                        const absoluteMinLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
+                        let currentTradeLamports = tradeLamports;
+                        let wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
+                        while (!wallet && currentTradeLamports > absoluteMinLamports) {
+                            currentTradeLamports = Math.floor(currentTradeLamports * 0.85);
+                            wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
+                        }
+                        if (!wallet) continue;
+                        const dexLower = (updated.poolDex ?? '').toLowerCase();
+                        const useMeteora = dexLower.includes('meteora');
+                        const useClmm = dexLower.includes('clmm');
+                        const useRaydium = dexLower.includes('raydium');
+                        let res = useMeteora
+                            ? await bot.executeMeteoraBuy(updated.poolId, wallet, currentTradeLamports)
+                            : useClmm
+                                ? await bot.executeRaydiumClmmBuy(updated.poolId, wallet, currentTradeLamports)
+                                : useRaydium
+                                    ? await bot.executeRaydiumBuy(updated.poolId, wallet, currentTradeLamports)
+                                    : await bot.executePumpBuy(wallet, currentTradeLamports);
+                        while (!res && currentTradeLamports > absoluteMinLamports) {
+                            currentTradeLamports = Math.floor(currentTradeLamports * 0.85);
+                            res = useMeteora
+                                ? await bot.executeMeteoraBuy(updated.poolId, wallet, currentTradeLamports)
+                                : useClmm
+                                    ? await bot.executeRaydiumClmmBuy(updated.poolId, wallet, currentTradeLamports)
+                                    : useRaydium
+                                        ? await bot.executeRaydiumBuy(updated.poolId, wallet, currentTradeLamports)
+                                        : await bot.executePumpBuy(wallet, currentTradeLamports);
+                        }
+                        if (!res) continue;
+                        const tradeUsd = safeSolUsd > 0 ? (res.volumeLamports / LAMPORTS_PER_SOL) * safeSolUsd : 0;
+                        updated.volumeLamports += res.volumeLamports;
+                        updated.volumeUsd += tradeUsd;
+                        updated.phaseVolumeUsd += tradeUsd;
+                        updated.remainingBudgetLamports += res.netLamports;
+                        ensureMeta(wallet.publicKey.toBase58()).lastBuyMs = tradeNowMs;
+                        ensureMeta(wallet.publicKey.toBase58()).solLamports = (ensureMeta(wallet.publicKey.toBase58()).solLamports ?? 0) + res.netLamports;
+                        ensureMeta(wallet.publicKey.toBase58()).tokenAmount = await bot.getTokenBalance(wallet.publicKey);
+                        const used = this.usedWalletsByTaskId.get(updated.id) ?? new Set<string>();
+                        used.add(wallet.publicKey.toBase58());
+                        this.usedWalletsByTaskId.set(updated.id, used);
+                        updated.walletsUsed = used.size;
+                        executedTrades += 1;
+                        this.upsertTask(chatId, updated);
+                    } else {
+                        const wallet = await pickSellWallet(cooldownMs, tradeNowMs);
+                        if (!wallet) continue;
+                        const id = wallet.publicKey.toBase58();
+                        const tokenBal = await refreshTokenBalance(id, wallet.publicKey);
+                        if (tokenBal <= 0n) continue;
+                        const sellAmount = tokenBal > 1n ? tokenBal / 2n : tokenBal;
+                        const dexLower = (updated.poolDex ?? '').toLowerCase();
+                        const useMeteora = dexLower.includes('meteora');
+                        const useClmm = dexLower.includes('clmm');
+                        const useRaydium = dexLower.includes('raydium');
+                        const res = useMeteora
+                            ? await bot.executeMeteoraSell(updated.poolId, wallet, sellAmount)
+                            : useClmm
+                                ? await bot.executeRaydiumClmmSell(updated.poolId, wallet, sellAmount)
+                                : useRaydium
+                                    ? await bot.executeRaydiumSell(updated.poolId, wallet, sellAmount)
+                                    : await bot.executePumpSell(wallet, sellAmount);
+                        if (!res) continue;
+                        const tradeUsd = safeSolUsd > 0 ? (res.volumeLamports / LAMPORTS_PER_SOL) * safeSolUsd : 0;
+                        updated.volumeLamports += res.volumeLamports;
+                        updated.volumeUsd += tradeUsd;
+                        updated.phaseVolumeUsd += tradeUsd;
+                        updated.remainingBudgetLamports += res.netLamports;
+                        ensureMeta(id).lastSellMs = tradeNowMs;
+                        ensureMeta(id).solLamports = (ensureMeta(id).solLamports ?? 0) + res.netLamports;
+                        ensureMeta(id).tokenAmount = await bot.getTokenBalance(wallet.publicKey);
+                        const used = this.usedWalletsByTaskId.get(updated.id) ?? new Set<string>();
+                        used.add(wallet.publicKey.toBase58());
+                        this.usedWalletsByTaskId.set(updated.id, used);
+                        updated.walletsUsed = used.size;
+                        executedTrades += 1;
+                        this.upsertTask(chatId, updated);
                     }
-                }
-                if (!this.config.isRunning) {
-                    await this.sendMessageWithRetry(chatId, 'ℹ️ Bot loop has been stopped.');
-                }
-            })();
 
-        } catch (error: unknown) {
-            this.config.isRunning = false;
-            console.error("Error during bot start logic:", error);
-            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
-            await this.sendMessageWithRetry(chatId, `❌ Error starting bot: ${errorMessage}. See console for details.`);
+                    const perTradeDelay = updated.phase === 'pump'
+                        ? Math.floor(this.randomBetween(updated.cycleIntervalMs * 0.05, updated.cycleIntervalMs * 0.2))
+                        : Math.floor(this.randomBetween(updated.cycleIntervalMs * 0.02, updated.cycleIntervalMs * 0.08));
+                    if (perTradeDelay > 0) await new Promise(resolve => setTimeout(resolve, perTradeDelay));
+                }
+
+                const post = this.getTasks(chatId).find(t => t.id === task.id);
+                if (post && post.status === 'active' && executedTrades > 0) {
+                    post.swapCycles += 1;
+                    this.upsertTask(chatId, post);
+                }
+
+                const cycleDelay = current.phase === 'pump'
+                    ? Math.floor(this.randomBetween(current.cycleIntervalMs * 0.6, current.cycleIntervalMs * 1.2))
+                    : Math.floor(this.randomBetween(current.cycleIntervalMs * 0.8, current.cycleIntervalMs * 1.2));
+                if (cycleDelay > 0) await new Promise(resolve => setTimeout(resolve, cycleDelay));
+            }
+        })();
+    }
+
+    private async activatePaidOrder(chatId: number) {
+        const session = this.getSession(chatId);
+        const ca = session.volume_ca;
+        const pool = session.volume_selected_pool;
+        if (!ca || !pool) return;
+        const tokenName = (await this.fetchTokenName(ca)) ?? ca;
+        const durationKey = session.volume_duration;
+        const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
+        const packageKey = session.volume_package;
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+        const taskCount = Math.max(1, Math.floor(packageData.tasks));
+        const solUsd = await this.getSolUsdPrice();
+        const totalBudgetLamports = Math.floor(packageData.sol * 0.6 * LAMPORTS_PER_SOL);
+        const poolDexLower = (pool.dex || '').toLowerCase();
+        const selectedFeeRate = this.getDexFeeRate(pool.dex);
+        const targetUsd = this.computeVolumeEstimateUsd(packageData.sol * 0.6, solUsd, selectedFeeRate);
+        const selectedDurationMs = this.parseDurationToMs(poolDexLower.includes('pump') ? durations.pump : durations.ray) ?? 0;
+        const pumpDurationMs = Math.floor(selectedDurationMs * 0.25);
+        const rayDurationMs = Math.max(0, selectedDurationMs - pumpDurationMs);
+        const pumpTargetUsd = targetUsd * 0.35;
+        const rayTargetUsd = Math.max(0, targetUsd - pumpTargetUsd);
+        const buyRange = this.parseBuySizeRange(poolDexLower.includes('pump') ? packageData.pump_buy_size : packageData.ray_buy_size);
+        const totalDesiredWallets = this.parseIntLike(poolDexLower.includes('pump') ? packageData.pump_makers : packageData.ray_makers) || 6;
+        const walletPoolSize = this.computeWalletPoolSize(totalBudgetLamports, totalDesiredWallets);
+        const perTaskBudgetLamports = Math.max(0, Math.floor(totalBudgetLamports / taskCount));
+
+        const setupBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
+        await setupBot.getPumpData();
+        if (!fs.existsSync('wallets.json')) setupBot.createWallets(walletPoolSize);
+        setupBot.loadWallets(walletPoolSize);
+
+        if (!fs.existsSync('./lut.json')) {
+            await setupBot.createLUT();
+        } else {
+            await setupBot.loadLUT();
+            if (!setupBot.lookupTableAccount) await setupBot.createLUT();
+        }
+        await setupBot.extendLUT();
+
+        const walletCount = setupBot.keypairs.length;
+        const effectiveBudgetLamports = Math.max(0, totalBudgetLamports - DefaultJitoTipAmountLamports - 50_000);
+        if (walletCount > 0 && effectiveBudgetLamports > 0) {
+            const perWallet = Math.max(2_200_000, Math.floor(effectiveBudgetLamports / walletCount));
+            await setupBot.distributeSOLChunked(perWallet);
+        }
+
+        const groups: any[][] = Array.from({ length: taskCount }, () => []);
+        setupBot.keypairs.forEach((kp: any, idx: number) => {
+            groups[idx % taskCount].push(kp);
+        });
+
+        for (let i = 0; i < groups.length; i++) {
+            const group = groups[i];
+            if (group.length === 0) continue;
+            const nowMs = Date.now();
+            const task: VolumeTask = {
+                id: `${Date.now()}_${i}_${Math.random().toString(16).slice(2)}`,
+                status: 'active',
+                tokenAddress: ca,
+                tokenName,
+                poolId: pool.address,
+                poolDex: pool.dex,
+                walletPoolSize: group.length,
+                walletsUsed: 0,
+                startedAtMs: nowMs,
+                endsAtMs: selectedDurationMs ? nowMs + selectedDurationMs : null,
+                volumeLamports: 0,
+                volumeUsd: 0,
+                swapCycles: 0,
+                packageKey,
+                durationKey: session.volume_duration,
+                phase: 'pump',
+                phaseStartedAtMs: nowMs,
+                phaseVolumeUsd: 0,
+                pumpTargetUsd,
+                pumpDurationMs,
+                rayTargetUsd,
+                rayDurationMs,
+                pumpBuyMinSol: buyRange.min,
+                pumpBuyMaxSol: buyRange.max,
+                rayBuyMinSol: buyRange.min,
+                rayBuyMaxSol: buyRange.max,
+                cycleIntervalMs: session.sleepMs,
+                remainingBudgetLamports: perTaskBudgetLamports,
+                walletCooldownMs: Math.max(2000, Math.floor(session.sleepMs * 0.6)),
+            };
+
+            const workerBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
+            workerBot.keypairs = group;
+            workerBot.lookupTableAccount = setupBot.lookupTableAccount;
+            workerBot.creator = setupBot.creator;
+            workerBot.bondingCurve = setupBot.bondingCurve;
+            workerBot.associatedBondingCurve = setupBot.associatedBondingCurve;
+            workerBot.virtualSolReserves = setupBot.virtualSolReserves;
+            workerBot.virtualTokenReserves = setupBot.virtualTokenReserves;
+
+            this.botsByTaskId.set(task.id, workerBot);
+            this.upsertTask(chatId, task);
+            await this.startRuntimeForTask(chatId, task);
         }
     }
 
-    private async _stopBotLogic(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        if (!this.config.isRunning) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Bot is not currently running.');
-            return;
-        }
-        this.config.isRunning = false;
-        await this.sendMessageWithRetry(chatId, '🛑 Stopping bot operations... Loop will finish current cycle if active, then halt.');
-    }
+    private setupHandlers() {
+        this.bot.onText(/\/start/, async (msg) => { await this.showMainMenu(msg); });
+        this.bot.onText(/\/volumebooster/, async (msg) => { await this.showVolumeBoosterMenu(msg); });
+        this.bot.onText(/\/freetrial/, async (msg) => { await this.showFreeTrialEntry(msg); });
+        this.bot.onText(/\/activetasks/, async (msg) => { await this.showActiveTasks(msg); });
+        this.bot.onText(/\/stats/, async (msg) => { await this.showStats(msg); });
+        this.bot.onText(/\/referrals/, async (msg) => { await this.showReferrals(msg); });
+        this.bot.onText(/\/help/, async (msg) => { await this.showVolumeBoosterMenu(msg); });
+        this.bot.onText(/\/settings/, async (msg) => { await this.showVolumeBoosterMenu(msg); });
+        this.bot.onText(/\/status/, async (msg) => { await this.showActiveTasks(msg); });
 
-    private async collectAllSol(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        await this.sendMessageWithRetry(chatId, '💰 Collect SOL from sub-wallets to main wallet...');
-        if (this.config.isRunning) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Bot is running. Please stop it first via /settings before collecting SOL.');
-            return;
-        }
-
-        try {
-            // if (!this.config.tokenAddress || (this.config.tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) {
-            //     await this.sendMessageWithRetry(chatId, '⚠️ Token address not set or is placeholder. Configure in /settings before collecting SOL.');
-            //     return;
-            // }
-            if (!this.pumpBot) {
-                this.pumpBot = new PumpfunVbot(
-                    this.config.tokenAddress,
-                    this.config.solAmount * LAMPORTS_PER_SOL,
-                    this.config.slippage
-                );
-            }
-            if (!this.pumpBot.keypairs || this.pumpBot.keypairs.length === 0) {
-                if (!fs.existsSync('wallets.json')) {
-                    await this.sendMessageWithRetry(chatId, '⚠️ wallets.json not found. Cannot collect SOL.'); return;
-                }
-                this.pumpBot.loadWallets();
-            }
-
-            if (!this.pumpBot.lookupTableAccount) {
-                if (!fs.existsSync('./lut.json')) {
-                    await this.sendMessageWithRetry(chatId, '⚠️ LUT.json not found. Cannot collect SOL efficiently.'); return;
-                }
-                await this.pumpBot.loadLUT();
-                if (!this.pumpBot.lookupTableAccount) {
-                    await this.sendMessageWithRetry(chatId, '⚠️ Failed to load LUT. Cannot collect SOL.'); return;
-                }
-            }
-
-
-            await this.pumpBot.collectSOL();
-            await this.sendMessageWithRetry(chatId, '✅ SOL collection complete successfully.');
-        } catch (error: unknown) {
-            console.error("Error during SOL collection:", error);
-            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
-            await this.sendMessageWithRetry(chatId, `⚠️ Error collecting SOL: ${errorMessage}. See console.`);
-        }
-    }
-
-    private async sellAllTokens(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        await this.sendMessageWithRetry(chatId, '💸 Attempting to sell all tokens from sub-wallets...');
-
-        if (this.config.isRunning) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Bot is currently running swaps. Please stop it first via /settings to sell all tokens.');
-            return;
-        }
-        if (!this.config.tokenAddress || (this.config.tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) {
-            await this.sendMessageWithRetry(chatId, '⚠️ Token address not set or is placeholder. Configure in /settings before selling.');
-            return;
-        }
-
-        try {
-            if (!this.pumpBot || this.pumpBot.mint.toBase58() !== this.config.tokenAddress) {
-                this.pumpBot = new PumpfunVbot(
-                    this.config.tokenAddress,
-                    0,
-                    this.config.slippage
-                );
-            }
-
-            // await this.sendMessageWithRetry(chatId, 'Fetching latest token data for selling...');
-            await this.pumpBot.getPumpData();
-
-            if (!fs.existsSync('wallets.json')) {
-                await this.sendMessageWithRetry(chatId, '⚠️ wallets.json not found. Cannot proceed.');
+        this.bot.on('message', async (msg) => {
+            const chatId = msg.chat.id;
+            const session = this.getSession(chatId);
+            const text = msg.text?.trim();
+            if (!text || text.startsWith('/')) return;
+            if (session.flow === 'VOLUME_CA_INPUT') {
+                session.volume_ca = text;
+                try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
+                const placeholder = await this.sendMessageWithRetry(chatId, 'Please wait while we fetching the pools…');
+                await this.showVolumePools(placeholder);
                 return;
             }
-            this.pumpBot.loadWallets();
-
-            if (!fs.existsSync('./lut.json')) {
-                await this.sendMessageWithRetry(chatId, '⚠️ LUT.json not found. Cannot proceed with efficient selling.');
+            if (session.flow === 'FREE_TRIAL_CA') {
+                session.free_trial_ca = text;
+                try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
+                const placeholder = await this.sendMessageWithRetry(chatId, 'Please wait while we fetching the pools…');
+                await this.showFreeTrialPools(placeholder);
                 return;
             }
-            await this.pumpBot.loadLUT();
-            if (!this.pumpBot.lookupTableAccount) {
-                await this.sendMessageWithRetry(chatId, '⚠️ Failed to load LUT. Cannot proceed.');
+        });
+
+        this.bot.on('callback_query', async (query) => {
+            const data = query.data;
+            const original = query.message as TelegramBot.Message | undefined;
+            if (!data || !original) return;
+            const chatId = original.chat.id;
+            const session = this.getSession(chatId);
+            await this.bot.answerCallbackQuery(query.id);
+
+            if (data === 'noop') return;
+            if (data === 'back_to_main') { await this.showMainMenu(original); return; }
+            if (data === 'volume_booster') { await this.showVolumeBoosterMenu(original); return; }
+            if (data === 'back_to_volume_menu') { await this.showVolumeBoosterMenu(original); return; }
+            if (data === 'free_trial') { await this.showFreeTrialEntry(original); return; }
+            if (data === 'volume_package_select') { session.volume_package = "2.5"; session.volume_duration = "20min|1h"; await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
+            if (data === 'volume_continue') { await this.showVolumeOrderSummary(original); return; }
+            if (data === 'back_to_volume_packages') { await this.showVolumePackageMenu(original); return; }
+            if (data === 'volume_order_confirm') { await this.showVolumeCaInput(original); return; }
+            if (data === 'back_to_volume_summary') { await this.showVolumeOrderSummary(original); return; }
+            if (data === 'back_to_volume_ca') { await this.showVolumeCaInput(original); return; }
+            if (data.startsWith('volume_pool_')) {
+                const idx = Number.parseInt(data.split('_').pop() ?? '0', 10) - 1;
+                const pools = session.volume_pools ?? [];
+                const selected = pools[idx];
+                if (selected) session.volume_selected_pool = selected;
+                await this.showVolumeReviewSummary(original);
+                return;
+            }
+            if (data === 'back_to_volume_pools') { await this.showVolumePools(original); return; }
+            if (data === 'volume_payment') { await this.showVolumePayment(original); return; }
+            if (data === 'cancel_payment') {
+                session.paymentStartBalanceLamports = undefined;
+                session.paymentExpectedLamports = undefined;
+                await this.showVolumeBoosterMenu(original);
+                return;
+            }
+            if (data === 'check_payment') {
+                const expected = session.paymentExpectedLamports;
+                const startBal = session.paymentStartBalanceLamports;
+                if (expected === undefined || startBal === undefined) {
+                    await this.sendMessageWithRetry(chatId, '⚠️ Payment session not initialized. Please click "Pay Order" again.');
+                    await this.showVolumeBoosterMenu(original);
+                    return;
+                }
+                let currentBal: number | null = null;
+                try {
+                    currentBal = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+                } catch {
+                    currentBal = null;
+                }
+                if (currentBal === null) {
+                    await this.sendMessageWithRetry(chatId, '⚠️ Could not check payment right now. Please try again.');
+                    return;
+                }
+                if (currentBal - startBal < expected) {
+                    await this.sendMessageWithRetry(chatId, 'Payment not found yet. Please wait a few moments and try again.');
+                    return;
+                }
+                session.paymentStartBalanceLamports = undefined;
+                session.paymentExpectedLamports = undefined;
+                try {
+                    const packageKey = session.volume_package;
+                    const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+                    await this.deductFeeBeforeExecution(packageData.sol);
+                } catch {
+                    await this.sendMessageWithRetry(chatId, '⚠️ Fee deduction failed (40%). Please ensure the main wallet has enough SOL and try again.');
+                    return;
+                }
+                await this.activatePaidOrder(chatId);
+                await this.showActiveTasks(original);
                 return;
             }
 
-            await this.pumpBot.sellAllTokensFromWallets();
-            await this.sendMessageWithRetry(chatId, '✅ Sell All Tokens process initiated. Check console for Jito bundle status.');
-            await this.sendMessageWithRetry(chatId, 'ℹ️ After selling, you might want to use "Collect All SOL" from settings.');
+            if (data === 'active_tasks' || data === 'refresh_tasks') { await this.showActiveTasks(original); return; }
+            if (data === 'view_stopped' || data === 'refresh_stopped') { await this.showStoppedTasks(original); return; }
+            if (data === 'back_to_active_tasks') { await this.showActiveTasks(original); return; }
 
-        } catch (error: unknown) {
-            console.error("Error during Sell All Tokens:", error);
-            const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred.';
-            await this.sendMessageWithRetry(chatId, `⚠️ Error selling tokens: ${errorMessage}. See console.`);
-        }
-    }
+            if (data === 'pause_task') { await this.pauseTask(chatId); await this.showActiveTasks(original); return; }
+            if (data === 'resume_task') { await this.resumeTask(chatId); await this.showActiveTasks(original); return; }
+            if (data === 'stop_task') { await this.stopTask(chatId); await this.showActiveTasks(original); return; }
 
-    private async _handleStatusLogic(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        let mainWalletSol = "N/A";
-        try {
-            const balance = await connection.getBalance(userKeypair.publicKey);
-            mainWalletSol = (balance / LAMPORTS_PER_SOL).toFixed(5) + " SOL";
-        } catch (e) { console.error("Failed to get main wallet balance for status:", e); }
+            if (data === 'set_time') {
+                await this.sendMessageWithRetry(chatId, 'Enter sleep time in milliseconds (e.g., 3000, min 1000ms):');
+                this.bot.once('message', async (responseMsg) => {
+                    if (responseMsg.chat.id !== chatId) return;
+                    const time = Number.parseInt(responseMsg.text ?? '', 10);
+                    if (Number.isFinite(time) && time >= 1000) session.sleepMs = time;
+                    try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
+                    await this.showActiveTasks(original);
+                });
+                return;
+            }
 
-        const tokenDisplay = this.config.tokenAddress
-            ? `${this.config.tokenAddress.substring(0, 6)}...${this.config.tokenAddress.substring(this.config.tokenAddress.length - 4)}`
-            : 'Not set';
+            if (data === 'set_token') {
+                await this.sendMessageWithRetry(chatId, 'Enter the Pump.fun token address:');
+                this.bot.once('message', async (responseMsg) => {
+                    if (responseMsg.chat.id !== chatId) return;
+                    const tokenAddress = responseMsg.text?.trim() ?? '';
+                    if (tokenAddress && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(tokenAddress)) {
+                        session.volume_ca = tokenAddress;
+                        session.free_trial_ca = tokenAddress;
+                    }
+                    try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
+                    await this.showActiveTasks(original);
+                });
+                return;
+            }
 
-        const status = `🤖 **Bot Status & Config** 🤖
------------------------------------
-- Running: ${this.config.isRunning ? '✅ Active' : '❌ Idle'}
-- Target Token: \`${tokenDisplay}\`
-- SOL/Swap Cycle: \`${this.config.solAmount.toFixed(4)} SOL\`
-- Slippage: \`${(this.config.slippage * 100).toFixed(1)}%\`
-- Cycle Sleep: \`${this.config.sleepTime}ms\`
-- Main Wallet: \`${mainWalletSol}\`
-- Authorized Users: \`${TELEGRAM_ALLOWED_USER_IDS.join(', ') || "ANYONE (CRITICAL SECURITY RISK!)"}\`
------------------------------------`;
-        await this.sendMessageWithRetry(chatId, status, { parse_mode: "Markdown" });
+            if (data === 'trial_buy') {
+                const selected = this.getSelectedTask(chatId);
+                const token = session.volume_ca ?? selected?.tokenAddress;
+                const poolId = selected?.poolId ?? session.volume_selected_pool?.address ?? 'N/A';
+                if (token) await this.trialBuy(chatId, token, poolId);
+                await this.showActiveTasks(original);
+                return;
+            }
+
+            if (data === 'sell_all_tokens') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                await this.sellAllTokens(chatId);
+                await this.showActiveTasks(original);
+                return;
+            }
+            if (data === 'collect_all_sol') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                await this.collectAllSol(chatId);
+                await this.showActiveTasks(original);
+                return;
+            }
+
+            if (data === 'stats') { await this.showStats(original); return; }
+            if (data === 'referrals') { await this.showReferrals(original); return; }
+            if (data === 'boost_volume') { await this.showVolumeBoosterMenu(original); return; }
+
+            if (data === 'back_to_free_trial') { await this.showFreeTrialEntry(original); return; }
+            if (data.startsWith('free_pool_')) {
+                const idx = Number.parseInt(data.split('_').pop() ?? '0', 10) - 1;
+                const pools = session.free_trial_pools ?? [];
+                const selected = pools[idx];
+                if (selected) session.free_trial_selected_pool = selected;
+                await this.showFreeTrialSummary(original);
+                return;
+            }
+            if (data === 'back_to_free_pools') { await this.showFreeTrialPools(original); return; }
+            if (data === 'start_free_trial') {
+                const ca = session.free_trial_ca;
+                const pool = session.free_trial_selected_pool;
+                if (ca && pool) await this.trialBuy(chatId, ca, pool.address);
+                await this.showActiveTasks(original);
+                return;
+            }
+
+            if (data === 'makers_booster') {
+                await this.sendMessageWithRetry(chatId, '⚡️ Makers Booster is not wired to this repo yet.');
+                return;
+            }
+            if (data === 'holders_booster') {
+                await this.sendMessageWithRetry(chatId, '🛡️ Holders Booster is not wired to this repo yet.');
+                return;
+            }
+        });
     }
 }
 
