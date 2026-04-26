@@ -342,50 +342,68 @@ class TelegramController {
         const nowMs = Date.now();
         if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 30_000) return this.solUsdCache.price;
 
-        try {
-            const headers = { 'User-Agent': 'Mozilla/5.0' };
-            const timeout = 8000;
+        const headers = { 'User-Agent': 'Mozilla/5.0' };
+        const timeout = 12000;
 
-            const resJup = await axios.get('https://price.jup.ag/v6/price', {
-                params: { ids: 'SOL' },
-                timeout,
-                headers,
-            });
-            const jupPrice = resJup.data?.data?.SOL?.price;
-            if (typeof jupPrice === 'number' && Number.isFinite(jupPrice) && jupPrice > 0) {
+        const tryNumber = (raw: unknown): number | null => {
+            if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+            if (typeof raw === 'string') {
+                const n = Number(raw);
+                if (Number.isFinite(n) && n > 0) return n;
+            }
+            return null;
+        };
+
+        try {
+            const resJup = await axios.get('https://price.jup.ag/v6/price', { params: { ids: 'SOL' }, timeout, headers });
+            const jupPrice = tryNumber(resJup.data?.data?.SOL?.price);
+            if (jupPrice) {
                 this.solUsdCache = { price: jupPrice, fetchedAtMs: nowMs };
                 return jupPrice;
             }
+        } catch {
+        }
 
+        try {
             const resCg = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
                 params: { ids: 'solana', vs_currencies: 'usd' },
                 timeout,
                 headers,
             });
-            const cgPrice = resCg.data?.solana?.usd;
-            if (typeof cgPrice === 'number' && Number.isFinite(cgPrice) && cgPrice > 0) {
+            const cgPrice = tryNumber(resCg.data?.solana?.usd);
+            if (cgPrice) {
                 this.solUsdCache = { price: cgPrice, fetchedAtMs: nowMs };
                 return cgPrice;
             }
+        } catch {
+        }
 
+        try {
+            const resCoinbase = await axios.get('https://api.coinbase.com/v2/prices/SOL-USD/spot', { timeout, headers });
+            const cbPrice = tryNumber(resCoinbase.data?.data?.amount);
+            if (cbPrice) {
+                this.solUsdCache = { price: cbPrice, fetchedAtMs: nowMs };
+                return cbPrice;
+            }
+        } catch {
+        }
+
+        try {
             const resBinance = await axios.get('https://api.binance.com/api/v3/ticker/price', {
                 params: { symbol: 'SOLUSDT' },
                 timeout,
                 headers,
             });
-            const binanceRaw = resBinance.data?.price;
-            const binancePrice = typeof binanceRaw === 'string' ? Number(binanceRaw) : binanceRaw;
-            if (typeof binancePrice === 'number' && Number.isFinite(binancePrice) && binancePrice > 0) {
+            const binancePrice = tryNumber(resBinance.data?.price);
+            if (binancePrice) {
                 this.solUsdCache = { price: binancePrice, fetchedAtMs: nowMs };
                 return binancePrice;
             }
-
-            if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 10 * 60_000) return this.solUsdCache.price;
-            return null;
         } catch {
-            if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 10 * 60_000) return this.solUsdCache.price;
-            return null;
         }
+
+        if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 10 * 60_000) return this.solUsdCache.price;
+        return null;
     }
 
     private async fetchTokenName(mint: string): Promise<string | null> {
@@ -664,8 +682,8 @@ class TelegramController {
         const executionBudgetLamports = Math.floor(executionBudgetSol * LAMPORTS_PER_SOL);
         const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
         const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
-        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : (packageData.pump_volume || this.formatCompactUsd(pumpVolumeUsd));
-        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : (packageData.ray_volume || this.formatCompactUsd(rayVolumeUsd));
+        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : 'N/A';
+        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : 'N/A';
         const pumpDesiredWallets = this.parseIntLike(packageData.pump_makers);
         const rayDesiredWallets = this.parseIntLike(packageData.ray_makers);
         const pumpWallets = this.computeWalletPoolSize(executionBudgetLamports, pumpDesiredWallets || 6, false, false);
@@ -715,8 +733,8 @@ class TelegramController {
         const executionBudgetSol = packageData.sol * (1 - this.getServiceFeeRate(packageKey));
         const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
         const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
-        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : (packageData.pump_volume || this.formatCompactUsd(pumpVolumeUsd));
-        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : (packageData.ray_volume || this.formatCompactUsd(rayVolumeUsd));
+        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : 'N/A';
+        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : 'N/A';
         const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${rayVolumeLabel} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${pumpVolumeLabel} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
