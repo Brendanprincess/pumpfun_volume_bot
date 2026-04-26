@@ -12,6 +12,7 @@ import {
 } from "@solana/web3.js";
 import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
+import * as bip39 from "bip39";
 
 import {
   GLOBAL,
@@ -200,7 +201,28 @@ export class PumpfunVbot {
     return createHash("sha256").update(inputBytes).digest().subarray(0, 32);
   }
 
+  private getBip39Mnemonic(): string | null {
+    const raw = SUBWALLET_MASTER_SEED;
+    if (!raw) return null;
+    const trimmed = raw.trim().replace(/\s+/g, " ");
+    const wordCount = trimmed.split(" ").filter(Boolean).length;
+    if (wordCount < 12 || wordCount > 24) return null;
+    if (!bip39.validateMnemonic(trimmed)) return null;
+    return trimmed;
+  }
+
   private deriveWalletKeypair(index: number): Keypair {
+    const mnemonic = this.getBip39Mnemonic();
+    if (mnemonic) {
+      const seed = bip39.mnemonicToSeedSync(mnemonic);
+      const path = `m/44'/501'/${index}'/0'`;
+      const ed25519 = require("ed25519-hd-key") as {
+        derivePath: (path: string, seedHex: string) => { key: Buffer };
+      };
+      const derived = ed25519.derivePath(path, seed.toString("hex"));
+      return Keypair.fromSeed(derived.key.subarray(0, 32));
+    }
+
     const masterSeed32 = this.getMasterSeed32();
     if (!masterSeed32) {
       throw new Error("SUBWALLET_MASTER_SEED is required to derive deterministic wallets.");
@@ -213,8 +235,12 @@ export class PumpfunVbot {
 
   createWallets(total = 10) {
     console.log(`\n- Creating ${total} new wallets...`);
+    const mnemonic = this.getBip39Mnemonic();
     const masterSeed32 = this.getMasterSeed32();
-    if (masterSeed32) {
+    if (mnemonic) {
+      const payload = { version: 3, type: "bip39", count: total, path: "m/44'/501'/{index}'/0'" };
+      fs.writeFileSync(WALLETS_JSON, JSON.stringify(payload, null, 2));
+    } else if (masterSeed32) {
       const payload = { version: 2, type: "deterministic", count: total };
       fs.writeFileSync(WALLETS_JSON, JSON.stringify(payload, null, 2));
     } else {
@@ -245,6 +271,18 @@ export class PumpfunVbot {
         const keypair = Keypair.fromSecretKey(bs58.decode(walletSecret));
         keypairs.push(keypair);
         if (keypairs.length >= total) break;
+      }
+    } else if (walletsData && typeof walletsData === "object" && walletsData.type === "bip39") {
+      if (!this.getBip39Mnemonic()) {
+        throw new Error("wallets.json is bip39 but SUBWALLET_MASTER_SEED is not a valid BIP39 mnemonic.");
+      }
+      const fileCount = Number.isFinite(walletsData.count) ? Number(walletsData.count) : 0;
+      if (fileCount < total) {
+        const next = { ...walletsData, count: total };
+        fs.writeFileSync(WALLETS_JSON, JSON.stringify(next, null, 2));
+      }
+      for (let i = 0; i < total; i++) {
+        keypairs.push(this.deriveWalletKeypair(i));
       }
     } else if (walletsData && typeof walletsData === "object" && walletsData.type === "deterministic") {
       if (!this.getMasterSeed32()) {
