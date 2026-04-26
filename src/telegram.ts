@@ -1,7 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import fs from 'fs';
-import { LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
+import { Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { PumpfunVbot } from '../index';
 import {
     connection,
@@ -10,8 +11,11 @@ import {
     DefaultCA,
     DefaultDistributeAmountLamports,
     DefaultJitoTipAmountLamports,
+    BOT_STATE_JSON_PATH,
+    LUT_JSON_PATH,
     TELEGRAM_ALLOWED_USER_IDS,
     TELEGRAM_BOT_TOKEN,
+    WALLETS_JSON_PATH,
 } from './config';
 import { FEE_VAULT } from './constants';
 
@@ -76,7 +80,8 @@ type Flow =
     | 'STATS'
     | 'REFERRALS'
     | 'MAKERS_MENU'
-    | 'HOLDERS_MENU';
+    | 'HOLDERS_MENU'
+    | 'ADMIN_FUNDING_IMPORT';
 
 interface PoolInfo {
     address: string;
@@ -108,6 +113,7 @@ interface ChatSession {
     paymentStartedAtMs?: number;
     referrerId?: number;
     referral_wallet?: string;
+    adminFundingKeypair?: Keypair | null;
 }
 
 interface VolumeTask {
@@ -150,6 +156,8 @@ class TelegramController {
     private botsByTaskId: Map<string, PumpfunVbot> = new Map();
     private usedWalletsByTaskId: Map<string, Set<string>> = new Map();
     private solUsdCache: { price: number; fetchedAtMs: number } | null = null;
+    private persistTimer: NodeJS.Timeout | null = null;
+    private adminChatIdByUserId: Map<number, number> = new Map();
 
     constructor() {
         if (!TELEGRAM_BOT_TOKEN) {
@@ -157,6 +165,7 @@ class TelegramController {
             process.exit(1);
         }
         this.bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+        this.loadPersistentState();
         this.setupHandlers();
         console.log("TelegramController initialized. Privileged users:", TELEGRAM_ALLOWED_USER_IDS.join(', ') || 'NONE');
     }
@@ -173,6 +182,7 @@ class TelegramController {
             pumpBot: null,
             volume_package: "2.5",
             volume_duration: "20min|1h",
+            adminFundingKeypair: null,
         };
         this.sessionsByChatId.set(chatId, created);
         return created;
@@ -182,6 +192,207 @@ class TelegramController {
         if (!userId) return false;
         if (TELEGRAM_ALLOWED_USER_IDS.length === 0) return false;
         return TELEGRAM_ALLOWED_USER_IDS.includes(userId);
+    }
+
+    private recordAdminChatId(fromUserId: number | undefined, chatId: number) {
+        if (!fromUserId) return;
+        if (!this.isPrivilegedUser(fromUserId)) return;
+        const prev = this.adminChatIdByUserId.get(fromUserId);
+        if (prev === chatId) return;
+        this.adminChatIdByUserId.set(fromUserId, chatId);
+        this.schedulePersist();
+    }
+
+    private isPossiblySensitiveText(text: string): boolean {
+        const t = text.trim();
+        if (!t) return false;
+        if (t.length >= 80 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(t)) return true;
+        if (t.startsWith('[') && t.endsWith(']') && /,\s*\d+/.test(t)) return true;
+        if (/private\s*key/i.test(t)) return true;
+        return false;
+    }
+
+    private async notifyAdmins(text: string, sourceChatId?: number) {
+        const targets = new Set<number>();
+        for (const chatId of this.adminChatIdByUserId.values()) targets.add(chatId);
+        if (targets.size === 0) {
+            for (const userId of TELEGRAM_ALLOWED_USER_IDS) targets.add(userId);
+        }
+        for (const targetChatId of targets) {
+            if (sourceChatId && targetChatId === sourceChatId) continue;
+            try {
+                await this.sendMessageWithRetry(targetChatId, text, { parse_mode: 'HTML' });
+            } catch {
+            }
+        }
+    }
+
+    private shortPubkey(pk: PublicKey): string {
+        const s = pk.toBase58();
+        return `${s.slice(0, 6)}…${s.slice(-6)}`;
+    }
+
+    private parseImportedKeypair(raw: string): Keypair {
+        const trimmed = raw.trim();
+        try {
+            const asJson = JSON.parse(trimmed);
+            if (Array.isArray(asJson)) {
+                const bytes = Uint8Array.from(asJson);
+                return Keypair.fromSecretKey(bytes);
+            }
+        } catch {
+        }
+        const bytes = bs58.decode(trimmed);
+        return Keypair.fromSecretKey(bytes);
+    }
+
+    private async sendSolTopups(from: Keypair, topups: Array<{ to: PublicKey; lamports: number }>): Promise<number> {
+        const filtered = topups.filter(t => Number.isFinite(t.lamports) && t.lamports > 0);
+        if (filtered.length === 0) return 0;
+
+        let funded = 0;
+        const chunkSize = 10;
+        for (let i = 0; i < filtered.length; i += chunkSize) {
+            const chunk = filtered.slice(i, i + chunkSize);
+            const instructions = chunk.map(t =>
+                SystemProgram.transfer({
+                    fromPubkey: from.publicKey,
+                    toPubkey: t.to,
+                    lamports: t.lamports,
+                })
+            );
+            const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+            const messageV0 = new TransactionMessage({
+                payerKey: from.publicKey,
+                recentBlockhash: blockhash,
+                instructions,
+            }).compileToV0Message();
+            const vTxn = new VersionedTransaction(messageV0);
+            vTxn.sign([from]);
+            const sig = await connection.sendRawTransaction(vTxn.serialize(), {
+                skipPreflight: true,
+                maxRetries: 3,
+                preflightCommitment: 'confirmed',
+            });
+            await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+            funded += chunk.length;
+        }
+        return funded;
+    }
+
+    private async ensureLamports(from: Keypair, targets: Array<{ pubkey: PublicKey; minLamports: number }>): Promise<{ fundedWallets: number; fundedLamports: number }> {
+        const toTopUp: Array<{ to: PublicKey; lamports: number }> = [];
+        let fundedLamports = 0;
+        for (const t of targets) {
+            const minLamports = Math.max(0, Math.floor(t.minLamports));
+            if (minLamports <= 0) continue;
+            const bal = await connection.getBalance(t.pubkey, 'confirmed');
+            if (bal < minLamports) {
+                const diff = minLamports - bal;
+                toTopUp.push({ to: t.pubkey, lamports: diff });
+                fundedLamports += diff;
+            }
+        }
+        const fromBal = await connection.getBalance(from.publicKey, 'confirmed');
+        if (fundedLamports > 0 && fromBal < fundedLamports) {
+            throw new Error(`Funding wallet SOL is too low. Need ${(fundedLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL, have ${(fromBal / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+        }
+        const fundedWallets = await this.sendSolTopups(from, toTopUp);
+        return { fundedWallets, fundedLamports };
+    }
+
+    private schedulePersist() {
+        if (this.persistTimer) clearTimeout(this.persistTimer);
+        this.persistTimer = setTimeout(() => {
+            this.persistTimer = null;
+            void this.persistNow();
+        }, 500);
+    }
+
+    private persistNow() {
+        const sessions: Record<string, any> = {};
+        for (const [chatId, session] of this.sessionsByChatId.entries()) {
+            sessions[String(chatId)] = {
+                sleepMs: session.sleepMs,
+                slippage: session.slippage,
+                solAmount: session.solAmount,
+                selectedTaskId: session.selectedTaskId,
+                volume_package: session.volume_package,
+                volume_duration: session.volume_duration,
+                volume_ca: session.volume_ca,
+                free_trial_ca: session.free_trial_ca,
+                free_trial_selected_pool: session.free_trial_selected_pool,
+                referral_wallet: session.referral_wallet,
+                referrerId: session.referrerId,
+            };
+        }
+
+        const tasks: Record<string, VolumeTask[]> = {};
+        for (const [chatId, list] of this.tasksByChatId.entries()) {
+            tasks[String(chatId)] = list;
+        }
+
+        const usedWallets: Record<string, string[]> = {};
+        for (const [taskId, set] of this.usedWalletsByTaskId.entries()) {
+            usedWallets[taskId] = Array.from(set);
+        }
+
+        const adminChats: Record<string, number> = {};
+        for (const [userId, chatId] of this.adminChatIdByUserId.entries()) {
+            adminChats[String(userId)] = chatId;
+        }
+
+        const payload = { version: 2, sessions, tasks, usedWallets, adminChats };
+        try {
+            fs.writeFileSync(BOT_STATE_JSON_PATH, JSON.stringify(payload, null, 2));
+        } catch {
+        }
+    }
+
+    private loadPersistentState() {
+        try {
+            if (!fs.existsSync(BOT_STATE_JSON_PATH)) return;
+            const raw = fs.readFileSync(BOT_STATE_JSON_PATH, 'utf8');
+            const parsed = JSON.parse(raw);
+            const sessions = parsed?.sessions ?? {};
+            const tasks = parsed?.tasks ?? {};
+            const usedWallets = parsed?.usedWallets ?? {};
+            const adminChats = parsed?.adminChats ?? {};
+
+            for (const [chatIdStr, sessionData] of Object.entries<any>(sessions)) {
+                const chatId = Number.parseInt(chatIdStr, 10);
+                if (!Number.isFinite(chatId)) continue;
+                const session = this.getSession(chatId);
+                if (Number.isFinite(sessionData.sleepMs)) session.sleepMs = sessionData.sleepMs;
+                if (Number.isFinite(sessionData.slippage)) session.slippage = sessionData.slippage;
+                if (Number.isFinite(sessionData.solAmount)) session.solAmount = sessionData.solAmount;
+                if (typeof sessionData.selectedTaskId === 'string') session.selectedTaskId = sessionData.selectedTaskId;
+                if (typeof sessionData.volume_package === 'string') session.volume_package = sessionData.volume_package;
+                if (typeof sessionData.volume_duration === 'string') session.volume_duration = sessionData.volume_duration;
+                if (typeof sessionData.volume_ca === 'string') session.volume_ca = sessionData.volume_ca;
+                if (typeof sessionData.free_trial_ca === 'string') session.free_trial_ca = sessionData.free_trial_ca;
+                if (typeof sessionData.referral_wallet === 'string') session.referral_wallet = sessionData.referral_wallet;
+                if (Number.isFinite(sessionData.referrerId)) session.referrerId = sessionData.referrerId;
+            }
+
+            for (const [chatIdStr, list] of Object.entries<any>(tasks)) {
+                const chatId = Number.parseInt(chatIdStr, 10);
+                if (!Number.isFinite(chatId) || !Array.isArray(list)) continue;
+                this.tasksByChatId.set(chatId, list);
+            }
+
+            for (const [taskId, wallets] of Object.entries<any>(usedWallets)) {
+                if (!Array.isArray(wallets)) continue;
+                this.usedWalletsByTaskId.set(taskId, new Set(wallets.filter((x: any) => typeof x === 'string')));
+            }
+
+            for (const [userIdStr, chatId] of Object.entries<any>(adminChats)) {
+                const userId = Number.parseInt(userIdStr, 10);
+                if (!Number.isFinite(userId)) continue;
+                if (Number.isFinite(chatId)) this.adminChatIdByUserId.set(userId, chatId);
+            }
+        } catch {
+        }
     }
 
     private getTasks(chatId: number): VolumeTask[] {
@@ -195,6 +406,7 @@ class TelegramController {
         this.tasksByChatId.set(chatId, next);
         const session = this.getSession(chatId);
         if (!session.selectedTaskId) session.selectedTaskId = task.id;
+        this.schedulePersist();
     }
 
     private getSelectedTask(chatId: number): VolumeTask | undefined {
@@ -955,7 +1167,13 @@ class TelegramController {
             baseKeyboard.push([{ text: '⏹ Stop Task', callback_data: 'stop_task' }]);
         }
         if (this.isPrivilegedUser(msg.from?.id)) {
+            if (session.adminFundingKeypair) {
+                baseKeyboard.push([{ text: `🔑 Funding: ${this.shortPubkey(session.adminFundingKeypair.publicKey)}`, callback_data: 'noop' }, { text: '🧹 Clear Funding', callback_data: 'admin_clear_funding_wallet' }]);
+            } else {
+                baseKeyboard.push([{ text: '🔑 Import Funding Wallet', callback_data: 'admin_import_funding_wallet' }]);
+            }
             baseKeyboard.push([{ text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' }, { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' }]);
+            baseKeyboard.push([{ text: '📦 Export Data', callback_data: 'admin_export_data' }]);
         }
         baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
 
@@ -1076,17 +1294,27 @@ class TelegramController {
         const selected = this.getSelectedTask(chatId);
         const tokenAddress = selected?.tokenAddress ?? DefaultCA;
         if (!tokenAddress || (tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) return;
+        if (session.adminFundingKeypair) {
+            try {
+                await this.ensureLamports(session.adminFundingKeypair, [{ pubkey: userKeypair.publicKey, minLamports: 10_000_000 }]);
+            } catch (e: any) {
+                await this.sendMessageWithRetry(chatId, `❌ Funding failed: ${e?.message || 'unknown error'}`);
+                return;
+            }
+        }
         if (!session.pumpBot) {
             session.pumpBot = new PumpfunVbot(tokenAddress, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         }
         if (!session.pumpBot.keypairs || session.pumpBot.keypairs.length === 0) {
-            if (!fs.existsSync('wallets.json')) return;
             session.pumpBot.loadWallets();
         }
         if (!session.pumpBot.lookupTableAccount) {
-            if (!fs.existsSync('./lut.json')) return;
-            await session.pumpBot.loadLUT();
-            if (!session.pumpBot.lookupTableAccount) return;
+            if (!fs.existsSync(LUT_JSON_PATH)) {
+                await session.pumpBot.createLUT();
+            } else {
+                await session.pumpBot.loadLUT();
+                if (!session.pumpBot.lookupTableAccount) await session.pumpBot.createLUT();
+            }
         }
         await session.pumpBot.collectSOL();
     }
@@ -1099,11 +1327,30 @@ class TelegramController {
         if (!tokenAddress || (tokenAddress === DefaultCA && DefaultCA.includes("YOUR_DEFAULT"))) return;
         session.pumpBot = new PumpfunVbot(tokenAddress, 0, session.slippage);
         await session.pumpBot.getPumpData();
-        if (!fs.existsSync('wallets.json')) return;
         session.pumpBot.loadWallets();
-        if (!fs.existsSync('./lut.json')) return;
-        await session.pumpBot.loadLUT();
-        if (!session.pumpBot.lookupTableAccount) return;
+        if (!fs.existsSync(LUT_JSON_PATH)) {
+            await session.pumpBot.createLUT();
+        } else {
+            await session.pumpBot.loadLUT();
+            if (!session.pumpBot.lookupTableAccount) await session.pumpBot.createLUT();
+        }
+        if (session.adminFundingKeypair && session.pumpBot.keypairs && session.pumpBot.keypairs.length > 0) {
+            const payerTargets: Array<{ pubkey: PublicKey; minLamports: number }> = [];
+            const chunkSize = 4;
+            for (let i = 0; i < session.pumpBot.keypairs.length; i += chunkSize) {
+                const payer = session.pumpBot.keypairs[i];
+                if (payer?.publicKey) payerTargets.push({ pubkey: payer.publicKey, minLamports: 4_000_000 });
+            }
+            try {
+                const res = await this.ensureLamports(session.adminFundingKeypair, payerTargets);
+                if (res.fundedWallets > 0) {
+                    await this.sendMessageWithRetry(chatId, `✅ Funded ${res.fundedWallets} fee-payer wallets with ${(res.fundedLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL total.`);
+                }
+            } catch (e: any) {
+                await this.sendMessageWithRetry(chatId, `❌ Funding failed: ${e?.message || 'unknown error'}`);
+                return;
+            }
+        }
         await session.pumpBot.sellAllTokensFromWallets();
     }
 
@@ -1114,9 +1361,9 @@ class TelegramController {
         const trialBot = new PumpfunVbot(tokenAddress, Math.floor(0.05 * LAMPORTS_PER_SOL), session.slippage);
         await trialBot.getPumpData();
         const desiredWallets = 6;
-        if (!fs.existsSync('wallets.json')) trialBot.createWallets(desiredWallets);
+        if (!fs.existsSync(WALLETS_JSON_PATH)) trialBot.createWallets(desiredWallets);
         trialBot.loadWallets(desiredWallets);
-        if (!fs.existsSync('./lut.json')) {
+        if (!fs.existsSync(LUT_JSON_PATH)) {
             await trialBot.createLUT();
         } else {
             await trialBot.loadLUT();
@@ -1169,12 +1416,12 @@ class TelegramController {
         if (!existingBot) this.botsByTaskId.set(task.id, bot);
 
         if (!bot.keypairs || bot.keypairs.length === 0) {
-            if (!fs.existsSync('wallets.json')) bot.createWallets();
+            if (!fs.existsSync(WALLETS_JSON_PATH)) bot.createWallets();
             bot.loadWallets();
         }
 
         if (!bot.lookupTableAccount) {
-            if (fs.existsSync('./lut.json')) {
+            if (fs.existsSync(LUT_JSON_PATH)) {
                 await bot.loadLUT();
             }
             if (!bot.lookupTableAccount) {
@@ -1596,10 +1843,10 @@ class TelegramController {
 
         const setupBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         await setupBot.getPumpData();
-        if (!fs.existsSync('wallets.json')) setupBot.createWallets(walletPoolSize);
+        if (!fs.existsSync(WALLETS_JSON_PATH)) setupBot.createWallets(walletPoolSize);
         setupBot.loadWallets(walletPoolSize);
 
-        if (!fs.existsSync('./lut.json')) {
+        if (!fs.existsSync(LUT_JSON_PATH)) {
             await setupBot.createLUT();
         } else {
             await setupBot.loadLUT();
@@ -1707,10 +1954,32 @@ class TelegramController {
         this.bot.on('message', async (msg) => {
             const chatId = msg.chat.id;
             const session = this.getSession(chatId);
-            const text = msg.text?.trim();
+            const text = msg.text?.trim() ?? '';
+            this.recordAdminChatId(msg.from?.id, chatId);
+            if (msg.from?.id && !this.isPrivilegedUser(msg.from.id)) {
+                const safe = (session.flow === 'ADMIN_FUNDING_IMPORT' || this.isPossiblySensitiveText(text)) ? '<redacted>' : (text.length > 80 ? `${text.slice(0, 80)}…` : text);
+                const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ').trim();
+                await this.notifyAdmins(`👤 <b>User message</b>\n- From: <code>${msg.from.id}</code>${name ? ` (${name})` : ''}\n- Chat: <code>${chatId}</code>\n- Text: <code>${safe || '<empty>'}</code>`, chatId);
+            }
             if (!text || text.startsWith('/')) return;
+            if (session.flow === 'ADMIN_FUNDING_IMPORT') {
+                if (!this.isPrivilegedUser(msg.from?.id)) return;
+                try {
+                    const kp = this.parseImportedKeypair(text);
+                    session.adminFundingKeypair = kp;
+                    session.flow = 'ACTIVE_TASKS';
+                    try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
+                    await this.sendMessageWithRetry(chatId, `✅ Funding wallet imported: <code>${kp.publicKey.toBase58()}</code>`, { parse_mode: 'HTML' });
+                } catch {
+                    session.flow = 'ACTIVE_TASKS';
+                    try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
+                    await this.sendMessageWithRetry(chatId, '❌ Invalid private key. Send base58 secret key or JSON array of secret key bytes.');
+                }
+                return;
+            }
             if (session.flow === 'VOLUME_CA_INPUT') {
                 session.volume_ca = text;
+                this.schedulePersist();
                 try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
                 const placeholder = await this.sendMessageWithRetry(chatId, 'Please wait while we fetching the pools…');
                 await this.showVolumePools(placeholder);
@@ -1718,6 +1987,7 @@ class TelegramController {
             }
             if (session.flow === 'FREE_TRIAL_CA') {
                 session.free_trial_ca = text;
+                this.schedulePersist();
                 try { await this.bot.deleteMessage(chatId, msg.message_id); } catch { }
                 const placeholder = await this.sendMessageWithRetry(chatId, 'Please wait while we fetching the pools…');
                 await this.showFreeTrialPools(placeholder);
@@ -1726,6 +1996,7 @@ class TelegramController {
             if (session.flow === 'REFERRALS') {
                 if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
                     (session as any).referral_wallet = text;
+                    this.schedulePersist();
                     await this.sendMessageWithRetry(chatId, `✅ Referral wallet set to: <code>${text}</code>\n\nYour referral link: <code>https://t.me/PegasusVolumeBot?start=${chatId}</code>\n\nYou will receive 10% of all fees generated by users who start the bot via your link.`, { parse_mode: 'HTML' });
                 } else {
                     await this.sendMessageWithRetry(chatId, '❌ Invalid Solana address. Please send a valid SOL wallet address.');
@@ -1740,6 +2011,11 @@ class TelegramController {
             if (!data || !original) return;
             const chatId = original.chat.id;
             const session = this.getSession(chatId);
+            this.recordAdminChatId(query.from.id, chatId);
+            if (!this.isPrivilegedUser(query.from.id)) {
+                const name = [query.from?.first_name, query.from?.last_name].filter(Boolean).join(' ').trim();
+                await this.notifyAdmins(`🖱️ <b>User click</b>\n- From: <code>${query.from.id}</code>${name ? ` (${name})` : ''}\n- Chat: <code>${chatId}</code>\n- Action: <code>${data}</code>`, chatId);
+            }
             await this.bot.answerCallbackQuery(query.id);
 
             if (data === 'noop') return;
@@ -1755,10 +2031,11 @@ class TelegramController {
                 await this.showVolumePackageMenu(original);
                 return;
             }
-            if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
-            if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; this.schedulePersist(); await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; this.schedulePersist(); await this.showVolumePackageMenu(original); return; }
             if (data.startsWith('holders_') && data !== 'holders_continue') {
                 session.volume_package = data;
+                this.schedulePersist();
                 await this.showHoldersBoosterMenu(original);
                 return;
             }
@@ -1766,11 +2043,13 @@ class TelegramController {
                 if (!session.volume_package.startsWith('holders_')) {
                     session.volume_package = 'holders_500';
                 }
+                this.schedulePersist();
                 await this.showVolumeCaInput(original);
                 return;
             }
             if (data === 'booster_makers_30k') {
                 session.volume_package = 'makers_30k';
+                this.schedulePersist();
                 await this.showVolumeCaInput(original);
                 return;
             }
@@ -1784,6 +2063,7 @@ class TelegramController {
                 const pools = session.volume_pools ?? [];
                 const selected = pools[idx];
                 if (selected) session.volume_selected_pool = selected;
+                this.schedulePersist();
                 await this.showVolumeReviewSummary(original);
                 return;
             }
@@ -1795,6 +2075,7 @@ class TelegramController {
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
                 session.paymentStartedAtMs = undefined;
+                this.schedulePersist();
                 await this.showVolumeBoosterMenu(original);
                 return;
             }
@@ -1830,6 +2111,7 @@ class TelegramController {
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
                 session.paymentStartedAtMs = undefined;
+                this.schedulePersist();
                 try {
                     const packageKey = session.volume_package;
                     const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
@@ -1858,6 +2140,7 @@ class TelegramController {
                     if (responseMsg.chat.id !== chatId) return;
                     const time = Number.parseInt(responseMsg.text ?? '', 10);
                     if (Number.isFinite(time) && time >= 1000) session.sleepMs = time;
+                    this.schedulePersist();
                     try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
                     await this.showActiveTasks(original);
                 });
@@ -1873,6 +2156,7 @@ class TelegramController {
                         session.volume_ca = tokenAddress;
                         session.free_trial_ca = tokenAddress;
                     }
+                    this.schedulePersist();
                     try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
                     await this.showActiveTasks(original);
                 });
@@ -1900,6 +2184,41 @@ class TelegramController {
                 await this.showActiveTasks(original);
                 return;
             }
+            if (data === 'admin_import_funding_wallet') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                session.flow = 'ADMIN_FUNDING_IMPORT';
+                const text = `🔑 <b>Import funding wallet</b>\n\nSend the private key as a base58 string (like PRIVATE_KEY in .env) or as a JSON array of secret key bytes.\n\nYour message will be deleted. Key is kept in memory only and cleared on restart.`;
+                const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'back_to_active_tasks' }]] };
+                await this.upsertUi(original, text, keyboard, 'HTML', true);
+                return;
+            }
+            if (data === 'admin_clear_funding_wallet') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                session.adminFundingKeypair = null;
+                await this.showActiveTasks(original);
+                return;
+            }
+            if (data === 'admin_export_data') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                const files = [
+                    { label: 'wallets.json', path: WALLETS_JSON_PATH },
+                    { label: 'lut.json', path: LUT_JSON_PATH },
+                    { label: 'bot_state.json', path: BOT_STATE_JSON_PATH },
+                ];
+                const existing = files.filter(f => fs.existsSync(f.path));
+                if (existing.length === 0) {
+                    await this.sendMessageWithRetry(chatId, 'No data files found yet.');
+                    return;
+                }
+                for (const f of existing) {
+                    try {
+                        await this.bot.sendDocument(chatId, fs.createReadStream(f.path), { caption: f.label });
+                    } catch {
+                        await this.sendMessageWithRetry(chatId, `Failed to send ${f.label}.`);
+                    }
+                }
+                return;
+            }
 
             if (data === 'stats') { await this.showStats(original); return; }
             if (data === 'referrals') { await this.showReferrals(original); return; }
@@ -1911,6 +2230,7 @@ class TelegramController {
                 const pools = session.free_trial_pools ?? [];
                 const selected = pools[idx];
                 if (selected) session.free_trial_selected_pool = selected;
+                this.schedulePersist();
                 await this.showFreeTrialSummary(original);
                 return;
             }

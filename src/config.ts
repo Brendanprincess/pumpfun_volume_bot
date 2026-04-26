@@ -1,6 +1,8 @@
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import base58 from "bs58";
 import * as dotenv from "dotenv";
+import * as fs from "fs";
+import * as path from "path";
 dotenv.config();
 
 // --- Essential Configurations - Bot will not run without these ---
@@ -24,6 +26,19 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
     process.exit(1);
 }
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+export const DATA_DIR = process.env.DATA_DIR?.trim() || process.cwd();
+try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch {
+}
+
+export const dataPath = (fileName: string) => path.join(DATA_DIR, fileName);
+export const WALLETS_JSON_PATH = dataPath("wallets.json");
+export const LUT_JSON_PATH = dataPath("lut.json");
+export const BOT_STATE_JSON_PATH = dataPath("bot_state.json");
+
+export const SUBWALLET_MASTER_SEED = process.env.SUBWALLET_MASTER_SEED?.trim() || "";
 
 const rawAllowedUserIds = process.env.TELEGRAM_ALLOWED_USER_IDS || "";
 export const TELEGRAM_ALLOWED_USER_IDS = rawAllowedUserIds

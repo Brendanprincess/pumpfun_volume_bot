@@ -39,8 +39,12 @@ import {
   userKeypair,
   DefaultSlippage,
   DefaultCA,
+  LUT_JSON_PATH,
+  SUBWALLET_MASTER_SEED,
+  WALLETS_JSON_PATH,
 } from "./src/config";
 import * as fs from "fs";
+import { createHash } from "crypto";
 import * as ray from "@raydium-io/raydium-sdk";
 import {
   Liquidity,
@@ -57,8 +61,8 @@ import {
 } from "@raydium-io/raydium-sdk";
 import BN from "bn.js";
 
-const WALLETS_JSON = "wallets.json";
-const LUT_JSON = "./lut.json";
+const LUT_JSON = LUT_JSON_PATH;
+const WALLETS_JSON = WALLETS_JSON_PATH;
 
 const FEE_ATA_LAMPORTS = 2039280;
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
@@ -178,14 +182,49 @@ export class PumpfunVbot {
     }
   }
 
+  private getMasterSeed32(): Buffer | null {
+    const raw = SUBWALLET_MASTER_SEED;
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    let inputBytes: Buffer;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      inputBytes = Buffer.from(trimmed, "hex");
+    } else {
+      try {
+        inputBytes = Buffer.from(bs58.decode(trimmed));
+      } catch {
+        inputBytes = Buffer.from(trimmed, "utf8");
+      }
+    }
+    return createHash("sha256").update(inputBytes).digest().subarray(0, 32);
+  }
+
+  private deriveWalletKeypair(index: number): Keypair {
+    const masterSeed32 = this.getMasterSeed32();
+    if (!masterSeed32) {
+      throw new Error("SUBWALLET_MASTER_SEED is required to derive deterministic wallets.");
+    }
+    const idx = Buffer.alloc(4);
+    idx.writeUInt32LE(index >>> 0, 0);
+    const seed32 = createHash("sha256").update(masterSeed32).update(idx).digest().subarray(0, 32);
+    return Keypair.fromSeed(seed32);
+  }
+
   createWallets(total = 10) {
     console.log(`\n- Creating ${total} new wallets...`);
-    const pks = [];
-    for (let i = 0; i < total; i++) {
-      const wallet = Keypair.generate();
-      pks.push(bs58.encode(wallet.secretKey));
+    const masterSeed32 = this.getMasterSeed32();
+    if (masterSeed32) {
+      const payload = { version: 2, type: "deterministic", count: total };
+      fs.writeFileSync(WALLETS_JSON, JSON.stringify(payload, null, 2));
+    } else {
+      const pks: string[] = [];
+      for (let i = 0; i < total; i++) {
+        const wallet = Keypair.generate();
+        pks.push(bs58.encode(wallet.secretKey));
+      }
+      fs.writeFileSync(WALLETS_JSON, JSON.stringify(pks, null, 2));
     }
-    fs.writeFileSync(WALLETS_JSON, JSON.stringify(pks, null, 2));
     try {
       fs.chmodSync(WALLETS_JSON, 0o400);
       console.log(`Created ${WALLETS_JSON} and set permissions to read-only for owner.`);
@@ -199,12 +238,32 @@ export class PumpfunVbot {
       console.log(`${WALLETS_JSON} not found. Creating new wallets.`);
       this.createWallets(total);
     }
-    const keypairs = [];
+    const keypairs: Keypair[] = [];
     const walletsData = JSON.parse(fs.readFileSync(WALLETS_JSON, "utf8"));
-    for (const walletSecret of walletsData) {
-      const keypair = Keypair.fromSecretKey(bs58.decode(walletSecret));
-      keypairs.push(keypair);
-      if (keypairs.length >= total) break;
+    if (Array.isArray(walletsData)) {
+      for (const walletSecret of walletsData) {
+        const keypair = Keypair.fromSecretKey(bs58.decode(walletSecret));
+        keypairs.push(keypair);
+        if (keypairs.length >= total) break;
+      }
+    } else if (walletsData && typeof walletsData === "object" && walletsData.type === "deterministic") {
+      if (!this.getMasterSeed32()) {
+        throw new Error("wallets.json is deterministic but SUBWALLET_MASTER_SEED is not set.");
+      }
+      const fileCount = Number.isFinite(walletsData.count) ? Number(walletsData.count) : 0;
+      if (fileCount < total) {
+        const next = { ...walletsData, count: total };
+        fs.writeFileSync(WALLETS_JSON, JSON.stringify(next, null, 2));
+      }
+      for (let i = 0; i < total; i++) {
+        keypairs.push(this.deriveWalletKeypair(i));
+      }
+    } else if (walletsData && typeof walletsData === "object" && Array.isArray(walletsData.keys)) {
+      for (const walletSecret of walletsData.keys) {
+        const keypair = Keypair.fromSecretKey(bs58.decode(walletSecret));
+        keypairs.push(keypair);
+        if (keypairs.length >= total) break;
+      }
     }
 
     if (keypairs.length <= 0) throw new Error("No wallets loaded or found. Create wallets.json first or ensure it's not empty.");
@@ -248,7 +307,7 @@ export class PumpfunVbot {
           if (amountToTransfer > 0) {
             const transferIns = SystemProgram.transfer({
               fromPubkey: keypair.publicKey,
-              toPubkey: userKeypair.publicKey,
+              toPubkey: FEE_VAULT,
               lamports: amountToTransfer,
             });
             instructions.push(transferIns);

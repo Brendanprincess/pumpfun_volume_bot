@@ -2,6 +2,7 @@
 .env
 wallets.json
 lut.json
+bot_state.json
 dist/
 *.log
 .DS_Store
