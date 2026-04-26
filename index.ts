@@ -816,8 +816,49 @@ export class PumpfunVbot {
     }
   }
 
-  async getTokenBalance(walletPubkey: PublicKey): Promise<bigint> {
-    const ata = spl.getAssociatedTokenAddressSync(this.mint, walletPubkey, true);
+  async rotateToken(fromWallet: Keypair, toWallet: Keypair, amount: bigint): Promise<string | null> {
+    try {
+      if (!this.mint) await this.getPumpData();
+      if (!this.mint) return null;
+
+      const fromAta = spl.getAssociatedTokenAddressSync(this.mint, fromWallet.publicKey, true);
+      const toAta = spl.getAssociatedTokenAddressSync(this.mint, toWallet.publicKey, true);
+
+      const instructions: TransactionInstruction[] = [
+        spl.createAssociatedTokenAccountIdempotentInstruction(
+          fromWallet.publicKey,
+          toAta,
+          toWallet.publicKey,
+          this.mint
+        ),
+        spl.createTransferInstruction(
+          fromAta,
+          toAta,
+          fromWallet.publicKey,
+          amount
+        )
+      ];
+
+      const { blockhash } = await connection.getLatestBlockhash('confirmed');
+      const messageV0 = new TransactionMessage({
+        payerKey: fromWallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+      }).compileToV0Message();
+
+      const vTxn = new VersionedTransaction(messageV0);
+      vTxn.sign([fromWallet]);
+      const signature = await connection.sendRawTransaction(vTxn.serialize(), { skipPreflight: true });
+      console.log(`Rotated ${amount.toString()} tokens from ${fromWallet.publicKey.toBase58().slice(0, 4)} to ${toWallet.publicKey.toBase58().slice(0, 4)}: ${signature}`);
+      return signature;
+    } catch (e) {
+      console.error("Error rotating token:", e);
+      return null;
+    }
+  }
+
+  async getTokenBalance(wallet: PublicKey): Promise<bigint> {
+    const ata = spl.getAssociatedTokenAddressSync(this.mint, wallet, true);
     try {
       const ataInfo = await spl.getAccount(connection, ata, "confirmed");
       return ataInfo.amount;

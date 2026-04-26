@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import fs from 'fs';
-import { LAMPORTS_PER_SOL, SystemProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import { LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { PumpfunVbot } from '../index';
 import {
     connection,
@@ -34,6 +34,13 @@ const VOLUME_PACKAGES: Record<string, { sol: number; pump_volume: string; pump_d
     "12": { sol: 12.0, pump_volume: "$78.4K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "1,400", pump_reward: "$233-$744", ray_volume: "$433.6K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "9,800", tasks: 2 },
     "18": { sol: 18.0, pump_volume: "$117.6K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "2,800", pump_reward: "$349-$1116", ray_volume: "$650.4K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "19,600", tasks: 4 },
     "36": { sol: 36.0, pump_volume: "$235.2K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "5,600", pump_reward: "$697-$2232", ray_volume: "$1.30M", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "39,200", tasks: 8 },
+    "makers_30k": { sol: 1.25, pump_volume: "$0", pump_duration: "2h", pump_buy_size: "0.0001 SOL", pump_makers: "30,000", pump_reward: "$0", ray_volume: "$0", ray_duration: "2h", ray_buy_size: "0.0001 SOL", ray_makers: "30,000", tasks: 1 },
+    "holders_500": { sol: 1.5, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "500", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "500", tasks: 1 },
+    "holders_1k": { sol: 3.0, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "1000", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "1000", tasks: 1 },
+    "holders_2.5k": { sol: 7.5, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "2500", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "2500", tasks: 1 },
+    "holders_5k": { sol: 15.0, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "5000", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "5000", tasks: 2 },
+    "holders_10k": { sol: 30.0, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "10000", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "10000", tasks: 4 },
+    "holders_20k": { sol: 60.0, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "20000", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "20000", tasks: 8 },
 };
 
 const DURATION_MAPPING: Record<string, { pump: string; ray: string }> = {
@@ -66,7 +73,9 @@ type Flow =
     | 'ACTIVE_TASKS'
     | 'STOPPED_TASKS'
     | 'STATS'
-    | 'REFERRALS';
+    | 'REFERRALS'
+    | 'MAKERS_MENU'
+    | 'HOLDERS_MENU';
 
 interface PoolInfo {
     address: string;
@@ -95,10 +104,14 @@ interface ChatSession {
     free_trial_selected_pool?: PoolInfo;
     paymentStartBalanceLamports?: number;
     paymentExpectedLamports?: number;
+    paymentStartedAtMs?: number;
+    referrerId?: number;
+    referral_wallet?: string;
 }
 
 interface VolumeTask {
     id: string;
+    type: 'volume' | 'makers' | 'holders';
     status: TaskStatus;
     tokenAddress: string;
     tokenName: string;
@@ -135,6 +148,7 @@ class TelegramController {
     private tasksByChatId: Map<number, VolumeTask[]> = new Map();
     private botsByTaskId: Map<string, PumpfunVbot> = new Map();
     private usedWalletsByTaskId: Map<string, Set<string>> = new Map();
+    private solUsdCache: { price: number; fetchedAtMs: number } | null = null;
 
     constructor() {
         if (!TELEGRAM_BOT_TOKEN) {
@@ -151,7 +165,7 @@ class TelegramController {
         if (existing) return existing;
         const created: ChatSession = {
             flow: 'MAIN_MENU',
-            sleepMs: 5000,
+            sleepMs: 617000, // 10 minutes 17 seconds
             slippage: DefaultSlippage,
             solAmount: DefaultDistributeAmountLamports / LAMPORTS_PER_SOL,
             isRunning: false,
@@ -325,12 +339,51 @@ class TelegramController {
     }
 
     private async getSolUsdPrice(): Promise<number | null> {
+        const nowMs = Date.now();
+        if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 30_000) return this.solUsdCache.price;
+
         try {
-            const res = await axios.get('https://price.jup.ag/v6/price', { params: { ids: 'SOL' }, timeout: 8000 });
-            const price = res.data?.data?.SOL?.price;
-            if (typeof price === 'number' && Number.isFinite(price) && price > 0) return price;
+            const headers = { 'User-Agent': 'Mozilla/5.0' };
+            const timeout = 8000;
+
+            const resJup = await axios.get('https://price.jup.ag/v6/price', {
+                params: { ids: 'SOL' },
+                timeout,
+                headers,
+            });
+            const jupPrice = resJup.data?.data?.SOL?.price;
+            if (typeof jupPrice === 'number' && Number.isFinite(jupPrice) && jupPrice > 0) {
+                this.solUsdCache = { price: jupPrice, fetchedAtMs: nowMs };
+                return jupPrice;
+            }
+
+            const resCg = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+                params: { ids: 'solana', vs_currencies: 'usd' },
+                timeout,
+                headers,
+            });
+            const cgPrice = resCg.data?.solana?.usd;
+            if (typeof cgPrice === 'number' && Number.isFinite(cgPrice) && cgPrice > 0) {
+                this.solUsdCache = { price: cgPrice, fetchedAtMs: nowMs };
+                return cgPrice;
+            }
+
+            const resBinance = await axios.get('https://api.binance.com/api/v3/ticker/price', {
+                params: { symbol: 'SOLUSDT' },
+                timeout,
+                headers,
+            });
+            const binanceRaw = resBinance.data?.price;
+            const binancePrice = typeof binanceRaw === 'string' ? Number(binanceRaw) : binanceRaw;
+            if (typeof binancePrice === 'number' && Number.isFinite(binancePrice) && binancePrice > 0) {
+                this.solUsdCache = { price: binancePrice, fetchedAtMs: nowMs };
+                return binancePrice;
+            }
+
+            if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 10 * 60_000) return this.solUsdCache.price;
             return null;
         } catch {
+            if (this.solUsdCache && nowMs - this.solUsdCache.fetchedAtMs < 10 * 60_000) return this.solUsdCache.price;
             return null;
         }
     }
@@ -365,11 +418,52 @@ class TelegramController {
         if (!solUsd || solUsd <= 0) return 0;
         if (!Number.isFinite(feeRate) || feeRate <= 0) return 0;
         const executionBudgetUsd = executionBudgetSol * solUsd;
-        return executionBudgetUsd / (2 * feeRate);
+        return executionBudgetUsd / feeRate;
     }
 
-    private computeWalletPoolSize(executionBudgetLamports: number, desiredWallets: number): number {
-        const minLamportsPerWallet = 2_200_000;
+    private getServiceFeeRate(packageKey: string): number {
+        if (packageKey.startsWith('holders')) return 0.3;
+        return 0.4;
+    }
+
+    private async hasReceivedPayment(expectedLamports: number, sinceMs: number): Promise<boolean> {
+        if (!Number.isFinite(expectedLamports) || expectedLamports <= 0) return false;
+        const signatures = await connection.getSignaturesForAddress(userKeypair.publicKey, { limit: 25 }, 'confirmed');
+        let receivedLamports = 0;
+        for (const s of signatures) {
+            const blockTimeMs = typeof s.blockTime === 'number' ? s.blockTime * 1000 : null;
+            if (blockTimeMs !== null && blockTimeMs < sinceMs) continue;
+            const tx = await connection.getTransaction(s.signature, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0,
+            });
+            const meta = tx?.meta;
+            const message = tx?.transaction.message;
+            if (!meta || !message) continue;
+            const accountKeys = message.getAccountKeys().staticAccountKeys;
+            const idx = accountKeys.findIndex(k => k.equals(userKeypair.publicKey));
+            if (idx < 0) continue;
+            const pre = meta.preBalances?.[idx] ?? 0;
+            const post = meta.postBalances?.[idx] ?? 0;
+            const delta = post - pre;
+            if (delta > 0) receivedLamports += delta;
+            if (receivedLamports >= expectedLamports) return true;
+        }
+        return receivedLamports >= expectedLamports;
+    }
+
+    private getMinimumLamportsPerWallet(isHolders: boolean, holdersBuyMaxSol = 0): number {
+        const defaultMinimumLamports = 2_200_000;
+        if (!isHolders) return defaultMinimumLamports;
+
+        const normalizedHoldersBuyMaxSol = Number.isFinite(holdersBuyMaxSol) && holdersBuyMaxSol > 0 ? holdersBuyMaxSol : 0.0007;
+        const maxBuyLamports = Math.floor(normalizedHoldersBuyMaxSol * LAMPORTS_PER_SOL);
+        return Math.max(2_600_000, maxBuyLamports + defaultMinimumLamports);
+    }
+
+    private computeWalletPoolSize(executionBudgetLamports: number, desiredWallets: number, isMakers: boolean, isHolders: boolean, holdersBuyMaxSol = 0): number {
+        const minLamportsPerWallet = this.getMinimumLamportsPerWallet(isHolders, holdersBuyMaxSol);
+
         if (!Number.isFinite(executionBudgetLamports) || executionBudgetLamports <= 0) return Math.max(1, Math.min(desiredWallets, 6));
         const maxWallets = Math.floor(executionBudgetLamports / minLamportsPerWallet);
         return Math.max(1, Math.min(desiredWallets, Math.max(1, maxWallets)));
@@ -383,20 +477,51 @@ class TelegramController {
         return 0.0025;
     }
 
-    private async deductFeeBeforeExecution(packageSol: number): Promise<void> {
-        const feeLamports = Math.floor(packageSol * 0.4 * LAMPORTS_PER_SOL);
-        if (feeLamports <= 0) return;
+    private async deductFeeBeforeExecution(chatId: number, packageSol: number): Promise<void> {
+        const session = this.getSession(chatId);
+        const feeRate = this.getServiceFeeRate(session.volume_package);
+        const totalFeeLamports = Math.floor(packageSol * feeRate * LAMPORTS_PER_SOL);
+        if (totalFeeLamports <= 0) return;
+
+        let referralLamports = 0;
+        let referralWallet: PublicKey | null = null;
+
+        if (session.referrerId) {
+            const refSession = this.sessionsByChatId.get(session.referrerId);
+            if (refSession && refSession.referral_wallet) {
+                try {
+                    referralWallet = new PublicKey(refSession.referral_wallet);
+                    referralLamports = Math.floor(totalFeeLamports * 0.1); // 10% referral cut
+                } catch {
+                    referralWallet = null;
+                }
+            }
+        }
+
+        const vaultLamports = totalFeeLamports - referralLamports;
+        const instructions: TransactionInstruction[] = [
+            SystemProgram.transfer({
+                fromPubkey: userKeypair.publicKey,
+                toPubkey: FEE_VAULT,
+                lamports: vaultLamports,
+            }),
+        ];
+
+        if (referralWallet && referralLamports > 0) {
+            instructions.push(
+                SystemProgram.transfer({
+                    fromPubkey: userKeypair.publicKey,
+                    toPubkey: referralWallet,
+                    lamports: referralLamports,
+                })
+            );
+        }
+
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
         const messageV0 = new TransactionMessage({
             payerKey: userKeypair.publicKey,
             recentBlockhash: blockhash,
-            instructions: [
-                SystemProgram.transfer({
-                    fromPubkey: userKeypair.publicKey,
-                    toPubkey: FEE_VAULT,
-                    lamports: feeLamports,
-                }),
-            ],
+            instructions,
         }).compileToV0Message();
         const vTxn = new VersionedTransaction(messageV0);
         vTxn.sign([userKeypair]);
@@ -430,7 +555,15 @@ class TelegramController {
         const related = tasks.filter(t => t.tokenAddress === task.tokenAddress && t.poolId === task.poolId);
         const activeCount = related.filter(t => t.status === 'active').length;
         const totalVolumeUsd = related.reduce((acc, t) => acc + (Number.isFinite(t.volumeUsd) ? t.volumeUsd : 0), 0);
-        return `🤖 Active tasks for:\n\nToken name: ${task.tokenName}\nToken ID: ${task.tokenAddress}\nPool ID: ${task.poolId}\n\n🟢 Active tasks: ${activeCount}\n📈 Volume generated: ${this.formatUsd(totalVolumeUsd)}\n\n🧠 Note: please select a task before pausing or adjusting.`;
+        const uniqueWallets = new Set<string>();
+        related.forEach(t => {
+            const used = this.usedWalletsByTaskId.get(t.id);
+            if (used) used.forEach(w => uniqueWallets.add(w));
+        });
+        const totalWalletsUsed = uniqueWallets.size;
+        const totalMakers = totalWalletsUsed;
+
+        return `🤖 Active tasks for:\n\nToken name: ${task.tokenName}\nToken ID: ${task.tokenAddress}\nPool ID: ${task.poolId}\n\n🟢 Active tasks: ${activeCount}\n📈 Volume generated: ${this.formatUsd(totalVolumeUsd)}\n⚡️ Makers delivered: ${totalMakers.toLocaleString()}\n👛 Wallets used: ${totalWalletsUsed.toLocaleString()}\n\n🧠 Note: please select a task before pausing or adjusting.`;
     }
 
     private async showMainMenu(msg: TelegramBot.Message) {
@@ -443,6 +576,10 @@ class TelegramController {
                     { text: '⚡️ Makers Booster', callback_data: 'makers_booster' },
                     { text: '🛡️ Holders Booster', callback_data: 'holders_booster' },
                 ],
+                [
+                    { text: '👥 Referrals', callback_data: 'referrals' },
+                    { text: '🛠️ Support', url: 'https://t.me/PegasusSupportBot' },
+                ],
             ],
         };
         const caption = `<b>Pegasus Volume Bot</b>\n\n<b>🚀 Volume Booster</b>\nUnmatched volume at the lowest price, with live stats and total control: adjust speed, pause orders, or change CA anytime.\n\n🧪 Other Tools: Makers booster, holders booster.\n\n💧 Supported Platforms: All Solana DEXes and launchpads.\n\n<b>🌐 Official Links:</b>\n<a href="https://www.pegswap.xyz">Website</a> | <a href="https://t.me/PegasusSupportBot">Support</a>`;
@@ -451,6 +588,48 @@ class TelegramController {
             return;
         }
         await this.sendMessageWithRetry(msg.chat.id, caption, { parse_mode: 'HTML', reply_markup: keyboard, disable_web_page_preview: true });
+    }
+
+    private async showMakersBoosterMenu(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'MAKERS_MENU';
+        const keyboard: TelegramBot.InlineKeyboardMarkup = {
+            inline_keyboard: [
+                [{ text: '✅ Pay Order (1.25 SOL)', callback_data: 'booster_makers_30k' }],
+                [{ text: '⬅️ Back', callback_data: 'back_to_main' }],
+            ],
+        };
+        const caption = `⚡️ <b>Boost makers to increase on-chain activity:</b>\n\nYou will receive up to 50,000 micro-buys from unique wallets, executed using organic patterns and smart delays. Best used together with /volumebooster.\n\n💧 Pools Supported: Raydium, Pumpfun, Pumpswap, Meteora.\n\n💊 <i>Pumpfun (1.25% swap fee):</i>\n⏳ Estimated duration: <b>2h</b>\n⚡️ Makers: <b>35-40K</b>\n━━━━━━━━━━━━━━━\n🟣 <i>Raydium (0.25% swap fee):</i>\n⏳ Estimated duration: <b>2h</b>\n⚡️ Makers: <b>50K</b>\n\n💸 Total to pay: <b>1.25 SOL</b>\n\n📄 Send the contract address of the token you want to create makers for.\n\n🔽 <i>Please send as a chat message.</i>`;
+        await this.upsertUi(msg, caption, keyboard, 'HTML', true);
+    }
+
+    private async showHoldersBoosterMenu(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'HOLDERS_MENU';
+        const packageKey = session.volume_package.startsWith('holders_') ? session.volume_package : 'holders_500';
+        const packageData = VOLUME_PACKAGES[packageKey] || VOLUME_PACKAGES['holders_500'];
+        const holdersCount = packageData.pump_makers;
+        const price = packageData.sol;
+
+        const keyboard: TelegramBot.InlineKeyboardMarkup = {
+            inline_keyboard: [
+                [{ text: 'Select Holders:', callback_data: 'noop' }],
+                [
+                    { text: '500 holders', callback_data: 'holders_500' },
+                    { text: '1K holders', callback_data: 'holders_1k' },
+                    { text: '2.5K holders', callback_data: 'holders_2.5k' },
+                ],
+                [
+                    { text: '5K holders', callback_data: 'holders_5k' },
+                    { text: '10K holders', callback_data: 'holders_10k' },
+                    { text: '20K holders', callback_data: 'holders_20k' },
+                ],
+                [{ text: '✅ Continue', callback_data: 'holders_continue' }],
+                [{ text: '⬅ Back', callback_data: 'back_to_main' }],
+            ],
+        };
+        const caption = `🛡 <b>Boost new holders to improve your token metrics:</b>\n\nYou'll get permanent new holders from unique wallets, each holding a tiny, randomized amount of your token to stay organic.\n\n🛡 New holders: <b>${holdersCount}</b>\n💸 Total to pay: <b>${price} SOL</b>`;
+        await this.upsertUi(msg, caption, keyboard, 'HTML', true);
     }
 
     private async showVolumeBoosterMenu(msg: TelegramBot.Message) {
@@ -481,17 +660,17 @@ class TelegramController {
         const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         const solUsd = await this.getSolUsdPrice();
-        const executionBudgetSol = packageData.sol * 0.6;
+        const executionBudgetSol = packageData.sol * (1 - this.getServiceFeeRate(packageKey));
         const executionBudgetLamports = Math.floor(executionBudgetSol * LAMPORTS_PER_SOL);
-        const pumpFeeRate = 0.0125;
-        const rayFeeRate = 0.0025;
-        const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, pumpFeeRate);
-        const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, rayFeeRate);
+        const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
+        const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
+        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : (packageData.pump_volume || this.formatCompactUsd(pumpVolumeUsd));
+        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : (packageData.ray_volume || this.formatCompactUsd(rayVolumeUsd));
         const pumpDesiredWallets = this.parseIntLike(packageData.pump_makers);
         const rayDesiredWallets = this.parseIntLike(packageData.ray_makers);
-        const pumpWallets = this.computeWalletPoolSize(executionBudgetLamports, pumpDesiredWallets || 6);
-        const rayWallets = this.computeWalletPoolSize(executionBudgetLamports, rayDesiredWallets || 6);
-        const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${this.formatCompactUsd(rayVolumeUsd)}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWallets.toLocaleString()}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${this.formatCompactUsd(pumpVolumeUsd)}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWallets.toLocaleString()}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>`;
+        const pumpWallets = this.computeWalletPoolSize(executionBudgetLamports, pumpDesiredWallets || 6, false, false);
+        const rayWallets = this.computeWalletPoolSize(executionBudgetLamports, rayDesiredWallets || 6, false, false);
+        const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${rayVolumeLabel}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWallets.toLocaleString()}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${pumpVolumeLabel}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWallets.toLocaleString()}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
                 [{ text: '-----Choose Volume-----', callback_data: 'noop' }],
@@ -533,10 +712,12 @@ class TelegramController {
         const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         const solUsd = await this.getSolUsdPrice();
-        const executionBudgetSol = packageData.sol * 0.6;
+        const executionBudgetSol = packageData.sol * (1 - this.getServiceFeeRate(packageKey));
         const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
         const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
-        const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${this.formatCompactUsd(rayVolumeUsd)} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${this.formatCompactUsd(pumpVolumeUsd)} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
+        const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : (packageData.pump_volume || this.formatCompactUsd(pumpVolumeUsd));
+        const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : (packageData.ray_volume || this.formatCompactUsd(rayVolumeUsd));
+        const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${rayVolumeLabel} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${pumpVolumeLabel} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
                 [{ text: '✅Continue', callback_data: 'volume_order_confirm' }],
@@ -589,25 +770,78 @@ class TelegramController {
             await this.showVolumePools(msg);
             return;
         }
+
         const packageKey = session.volume_package;
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
-        const text = `<b>📋 Review your order summary:</b>\n\n📄 Token address:\n<b>${session.volume_ca}</b>\n\n💧 Pool address:\n<b>${pool.address}</b>\n\n📦 <b>Package: ${packageKey} SOL (${packageData.tasks} tasks)</b>\n\n💸 Total to pay: <b>${packageData.sol} SOL</b>`;
-        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Pay Order', callback_data: 'volume_payment' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_pools' }]] };
+        const durationKey = session.volume_duration;
+        const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
+        const poolDexLower = (pool.dex || '').toLowerCase();
+
+        const solUsd = await this.getSolUsdPrice();
+        const executionBudgetSol = packageData.sol * (1 - this.getServiceFeeRate(packageKey));
+        const selectedFeeRate = this.getDexFeeRate(pool.dex);
+        const estimatedVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, selectedFeeRate);
+
+        const durationLabel = poolDexLower.includes('pump') ? durations.pump : durations.ray;
+        const buySizeLabel = poolDexLower.includes('pump') ? packageData.pump_buy_size : packageData.ray_buy_size;
+
+        const text = `<b>📋 Review your order summary:</b>\n\n📄 Token address:\n<b>${session.volume_ca}</b>\n\n💧 Pool:\n<b>${pool.dex}</b>\n<b>${pool.address}</b>\n\n📈 Estimated volume: <b>${this.formatCompactUsd(estimatedVolumeUsd)}</b>\n⏳ Duration: <b>${durationLabel}</b>\n🤑 Max buy: <b>${buySizeLabel}</b>\n\n📦 <b>Package: ${packageKey} SOL (${packageData.tasks} tasks)</b>\n💸 Total to pay: <b>${packageData.sol} SOL</b>`;
+
+        let callbackData = 'volume_payment';
+        if (packageKey.startsWith('makers')) callbackData = 'makers_payment';
+        else if (packageKey.startsWith('holders')) callbackData = 'holders_payment';
+
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Pay Order', callback_data: callbackData }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_pools' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showMakersPayment(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_PAYMENT'; // Reusing flow state
+        session.paymentStartedAtMs = Date.now();
+        const packageKey = session.volume_package;
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["makers_30k"];
+        session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        try {
+            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+        } catch {
+            session.paymentStartBalanceLamports = undefined;
+        }
+        const address = userKeypair.publicKey.toBase58();
+        const text = `💸 <b>Pay for your makers boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
+        await this.upsertUi(msg, text, keyboard, 'HTML', true);
+    }
+
+    private async showHoldersPayment(msg: TelegramBot.Message) {
+        const session = this.getSession(msg.chat.id);
+        session.flow = 'VOLUME_PAYMENT'; // Reusing flow state
+        session.paymentStartedAtMs = Date.now();
+        const packageKey = session.volume_package;
+        const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["holders_500"];
+        session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        try {
+            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+        } catch {
+            session.paymentStartBalanceLamports = undefined;
+        }
+        const address = userKeypair.publicKey.toBase58();
+        const text = `💸 <b>Pay for your holders boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
 
     private async showVolumePayment(msg: TelegramBot.Message) {
         const session = this.getSession(msg.chat.id);
         session.flow = 'VOLUME_PAYMENT';
+        session.paymentStartedAtMs = Date.now();
         const packageKey = session.volume_package;
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
-        if (session.paymentStartBalanceLamports === undefined) {
-            try {
-                session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
-            } catch {
-                session.paymentStartBalanceLamports = undefined;
-            }
+        try {
+            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+        } catch {
+            session.paymentStartBalanceLamports = undefined;
         }
         const address = userKeypair.publicKey.toBase58();
         const text = `💸 <b>Pay for your order and start your volume-growth journey!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
@@ -664,7 +898,12 @@ class TelegramController {
             return;
         }
         const text = `<b>📋 Review your order summary:</b>\n\n<b>📄 Token address:</b>\n${ca}\n\n<b>💧 Liquidity Pool:</b>\n${pool.address}`;
-        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅Continue', callback_data: 'start_free_trial' }], [{ text: '⬅️ Back', callback_data: 'back_to_free_pools' }]] };
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { 
+            inline_keyboard: [
+                [{ text: '✅ Continue', callback_data: 'start_free_trial' }], 
+                [{ text: '💬 Support', url: SUPPORT_URL }, { text: '⬅️ Back', callback_data: 'back_to_free_pools' }]
+            ] 
+        };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
 
@@ -734,9 +973,25 @@ class TelegramController {
         const session = this.getSession(chatId);
         session.flow = 'STATS';
         const tasks = this.getTasks(chatId);
+
+        const volumeTasks = tasks.filter(t => t.type === 'volume');
+        const totalVolumeTasks = volumeTasks.length;
         const totalVolumeUsd = tasks.reduce((acc, t) => acc + (Number.isFinite(t.volumeUsd) ? t.volumeUsd : 0), 0);
-        const totalTasks = tasks.length;
-        const text = `🔢 <b>Total stats:</b>\n\n🤖 Volume boost tasks executed: <b>${totalTasks}</b>\n📈 Volume generated: <b>${this.formatUsd(totalVolumeUsd)}</b>\n⚡️ Makers delivered: <b>0</b>\n👛 Wallets used: <b>0</b>\n\n🔽 <i>Start your first volume boost task to improve your token!</i>`;
+
+        const allUsedWallets = new Set<string>();
+        for (const task of tasks) {
+            if (task.type === 'holders') continue;
+            const usedForTask = this.usedWalletsByTaskId.get(task.id);
+            if (usedForTask) usedForTask.forEach(w => allUsedWallets.add(w));
+        }
+        const totalWalletsUsed = allUsedWallets.size;
+        const totalMakers = totalWalletsUsed;
+
+        const footer = totalVolumeTasks > 0
+            ? '🔽 Start another volume boost task to improve your token!'
+            : '🔽 Start your first volume boost task to improve your token!';
+
+        const text = `🔢 Total stats:\n\n🤖 Volume boost tasks executed: ${totalVolumeTasks}\n📈 Volume generated: ${this.formatUsd(totalVolumeUsd)}\n⚡️ Makers delivered: ${totalMakers.toLocaleString()}\n👛 Wallets used: ${totalWalletsUsed.toLocaleString()}\n\n${footer}`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '🚀 Boost Volume', callback_data: 'boost_volume' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]] };
         if (FILE_IDS.stats_image) {
             await this.bot.sendPhoto(chatId, FILE_IDS.stats_image, { caption: text, parse_mode: 'HTML', reply_markup: keyboard });
@@ -749,8 +1004,24 @@ class TelegramController {
         const chatId = msg.chat.id;
         const session = this.getSession(chatId);
         session.flow = 'REFERRALS';
-        const text = `👛 Please share your Solana (SOL) wallet address to receive your referral cut from purchases made through your referral link.\n\nℹ️ Note: referral activation may take up to 24 hours. Please check your referral link status in the next step.\n\n🔽 <i>Please send your wallet address as a chat message.</i>`;
-        const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '🧠 Docs', url: 'https://chartup.gitbook.io/docs/' }], [{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]] };
+        
+        const referralLink = `https://t.me/PegasusVolumeBot?start=${chatId}`;
+        const wallet = session.referral_wallet || 'Not set';
+        
+        let text = '';
+        if (session.referral_wallet) {
+            text = `<b>👥 Referral System</b>\n\nInvite others and earn <b>10%</b> of their service fees!\n\n<b>Your Referral Link:</b>\n<code>${referralLink}</code>\n\n<b>Current Payout Wallet:</b>\n<code>${wallet}</code>\n\nTo change your payout wallet, simply send a new Solana address to this chat.`;
+        } else {
+            text = `<b>👥 Referral System</b>\n\nInvite others and earn <b>10%</b> of their service fees!\n\n<b>Your Referral Link:</b>\n<code>${referralLink}</code>\n\n<b>Current Payout Wallet:</b>\n<code>${wallet}</code>\n\n🔽 <i>Please share your Solana (SOL) wallet address to receive your referral cut.</i>`;
+        }
+
+        const keyboard: TelegramBot.InlineKeyboardMarkup = { 
+            inline_keyboard: [
+                [{ text: '🧠 Docs', url: 'https://chartup.gitbook.io/docs/' }], 
+                [{ text: '⬅️ Back', callback_data: 'back_to_main' }]
+            ] 
+        };
+        
         if (FILE_IDS.referrals_image) {
             await this.bot.sendPhoto(chatId, FILE_IDS.referrals_image, { caption: text, parse_mode: 'HTML', reply_markup: keyboard });
             return;
@@ -839,6 +1110,7 @@ class TelegramController {
         const volumeUsd = solUsd ? (cycleVolumeLamports / LAMPORTS_PER_SOL) * solUsd : 0;
         const task: VolumeTask = {
             id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+            type: 'volume',
             status: 'stopped',
             tokenAddress,
             tokenName,
@@ -933,6 +1205,10 @@ class TelegramController {
                     const id = w.publicKey.toBase58();
                     const meta = ensureMeta(id);
                     if (nowMs - meta.lastBuyMs < cooldownMs) continue;
+
+                    // Holders tasks: Each wallet buys once and holds
+                    if (task.type === 'holders' && meta.lastBuyMs > 0) continue;
+
                     const solLamports = await refreshSolBalance(id, w.publicKey);
                     if (solLamports >= tradeLamports + 20000) candidates.push(w);
                 }
@@ -949,8 +1225,20 @@ class TelegramController {
                     const id = w.publicKey.toBase58();
                     const meta = ensureMeta(id);
                     if (nowMs - meta.lastSellMs < cooldownMs) continue;
+                    // Prefer wallets that didn't buy in the last 60 seconds to satisfy "buy wallets should not sell"
+                    if (nowMs - meta.lastBuyMs < 60000) continue;
                     const tokenBal = await refreshTokenBalance(id, w.publicKey);
                     if (tokenBal > 0n) candidates.push(w);
+                }
+                if (candidates.length === 0) {
+                    // Fallback to any wallet with tokens if no "non-buying" wallets are available
+                    for (const w of wallets) {
+                        const id = w.publicKey.toBase58();
+                        const meta = ensureMeta(id);
+                        if (nowMs - meta.lastSellMs < cooldownMs) continue;
+                        const tokenBal = await refreshTokenBalance(id, w.publicKey);
+                        if (tokenBal > 0n) candidates.push(w);
+                    }
                 }
                 if (candidates.length === 0) return null;
                 candidates.sort((a, b) => {
@@ -962,10 +1250,22 @@ class TelegramController {
                 return pickFrom[Math.floor(Math.random() * pickFrom.length)];
             };
 
-            const cyclePattern: Array<'buy' | 'sell'> = ['buy', 'buy', 'buy', 'sell', 'sell'];
+            const getCyclePattern = (): Array<'buy' | 'sell'> => {
+                if (task.type === 'holders') return ['buy', 'buy', 'buy']; // Holders only buy
+                if (task.type === 'makers') return ['buy', 'sell', 'buy', 'sell']; // Makers cycle rapidly
+                const patterns: Array<'buy' | 'sell'>[] = [
+                    ['buy', 'buy', 'buy', 'sell', 'sell'],
+                    ['buy', 'buy', 'sell', 'buy', 'sell'],
+                    ['buy', 'sell', 'buy', 'buy', 'sell'],
+                    ['buy', 'buy', 'buy', 'buy', 'sell'],
+                    ['buy', 'buy', 'sell', 'sell', 'buy'],
+                ];
+                return patterns[Math.floor(Math.random() * patterns.length)];
+            };
             const reserveLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
 
             while (true) {
+                const cyclePattern = getCyclePattern();
                 const current = this.getTasks(chatId).find(t => t.id === task.id);
                 if (!current || current.status !== 'active') break;
                 const nowMs = Date.now();
@@ -981,6 +1281,11 @@ class TelegramController {
 
                 if (phaseDurationMs > 0 && phaseElapsedMs >= phaseDurationMs) {
                     if (current.phase === 'pump') {
+                        if (current.rayDurationMs <= 0 && current.rayTargetUsd <= 0) {
+                            current.status = 'stopped';
+                            this.upsertTask(chatId, current);
+                            break;
+                        }
                         current.phase = 'ray';
                         current.phaseStartedAtMs = nowMs;
                         current.phaseVolumeUsd = 0;
@@ -994,6 +1299,11 @@ class TelegramController {
 
                 if (phaseTargetUsd > 0 && current.phaseVolumeUsd >= phaseTargetUsd) {
                     if (current.phase === 'pump') {
+                        if (current.rayDurationMs <= 0 && current.rayTargetUsd <= 0) {
+                            current.status = 'stopped';
+                            this.upsertTask(chatId, current);
+                            break;
+                        }
                         current.phase = 'ray';
                         current.phaseStartedAtMs = nowMs;
                         current.phaseVolumeUsd = 0;
@@ -1011,56 +1321,98 @@ class TelegramController {
                     break;
                 }
 
+                // Stop Holders task if target wallet count (holders) reached
+                if (task.type === 'holders' && current.walletsUsed >= current.walletPoolSize) {
+                    current.status = 'stopped';
+                    this.upsertTask(chatId, current);
+                    break;
+                }
+
                 const solUsd = await this.getSolUsdPrice();
                 const safeSolUsd = solUsd && solUsd > 0 ? solUsd : 0;
                 const remainingPhaseUsd = Math.max(0, phaseTargetUsd - current.phaseVolumeUsd);
                 const remainingPhaseTimeMs = Math.max(0, phaseDurationMs - phaseElapsedMs);
 
                 let tradeSizeSol = 0;
-                if (current.phase === 'pump') {
-                    const base = this.randomBetween(current.pumpBuyMinSol, current.pumpBuyMaxSol);
+                
+                if (task.type === 'makers') {
+                    const minSol = current.phase === 'pump' ? current.pumpBuyMinSol : current.rayBuyMinSol;
+                    const maxSol = current.phase === 'pump' ? current.pumpBuyMaxSol : current.rayBuyMaxSol;
+                    tradeSizeSol = this.randomBetween(minSol, maxSol);
+                } else if (task.type === 'holders') {
+                    const minSol = current.phase === 'pump' ? current.pumpBuyMinSol : current.rayBuyMinSol;
+                    const maxSol = current.phase === 'pump' ? current.pumpBuyMaxSol : current.rayBuyMaxSol;
+                    tradeSizeSol = this.randomBetween(minSol, maxSol);
+                } else {
+                    const solUsd = await this.getSolUsdPrice();
+                    const safeSolUsd = solUsd && solUsd > 0 ? solUsd : 0;
+                    
+                    // Unified weighted random trade sizes for all DEXes to ensure organic footprint
+                    const rand = Math.random();
+                    let base = 0;
+                    if (rand < 0.1) { // 10% Huge chunks ($20 - $70)
+                        base = this.randomBetween(0.14, 0.5); 
+                    } else if (rand < 0.3) { // 20% Big chunks ($5 - $15)
+                        base = this.randomBetween(0.035, 0.1);
+                    } else if (rand < 0.7) { // 40% Medium chunks ($1 - $4)
+                        base = this.randomBetween(0.007, 0.028);
+                    } else { // 30% Small chunks ($0.1 - $0.8)
+                        base = this.randomBetween(0.0007, 0.005);
+                    }
+
                     let mult = 1;
                     if (phaseDurationMs > 0 && phaseTargetUsd > 0) {
                         const expectedByNow = (phaseTargetUsd * phaseElapsedMs) / phaseDurationMs;
-                        if (current.phaseVolumeUsd < expectedByNow * 0.9) mult = 1.2;
-                        if (current.phaseVolumeUsd > expectedByNow * 1.1) mult = 0.8;
+                        if (current.phaseVolumeUsd < expectedByNow * 0.9) mult = 1.3; // More aggressive catchup
+                        if (current.phaseVolumeUsd > expectedByNow * 1.1) mult = 0.7;
                     }
-                    tradeSizeSol = this.clamp(base * mult, current.pumpBuyMinSol, current.pumpBuyMaxSol);
-                } else {
-                    const expectedCycles = current.cycleIntervalMs > 0 ? remainingPhaseTimeMs / current.cycleIntervalMs : 1;
-                    const tradesLeft = Math.max(1, Math.floor(expectedCycles * cyclePattern.length));
-                    const idealUsd = tradesLeft > 0 ? remainingPhaseUsd / tradesLeft : remainingPhaseUsd;
-                    const idealSol = safeSolUsd > 0 ? idealUsd / safeSolUsd : this.randomBetween(current.rayBuyMinSol, current.rayBuyMaxSol);
-                    const randomized = idealSol * this.randomBetween(0.8, 1.2);
-                    tradeSizeSol = this.clamp(randomized, current.rayBuyMinSol, current.rayBuyMaxSol);
+                    
+                    if (current.phase === 'pump') {
+                        tradeSizeSol = base * mult;
+                    } else {
+                        // For Raydium/Meteora, we still want to respect the target volume 
+                        // but use the same weighted "base" distribution for realism
+                        const expectedCycles = current.cycleIntervalMs > 0 ? remainingPhaseTimeMs / current.cycleIntervalMs : 1;
+                        const tradesLeft = Math.max(1, Math.floor(expectedCycles * cyclePattern.length));
+                        const idealUsd = tradesLeft > 0 ? remainingPhaseUsd / tradesLeft : remainingPhaseUsd;
+                        const idealSol = safeSolUsd > 0 ? idealUsd / safeSolUsd : base;
+                        
+                        // Blend the "ideal" size with our "organic base" size
+                        tradeSizeSol = (idealSol * 0.7 + base * 0.3) * mult;
+                    }
                 }
 
                 let tradeLamports = Math.floor(tradeSizeSol * LAMPORTS_PER_SOL);
                 tradeLamports = Math.max(0, Math.min(tradeLamports, Math.max(0, current.remainingBudgetLamports - reserveLamports)));
+                
+                // Add jitter to cycle interval (±20%) for more organic timing
+                const jitter = current.cycleIntervalMs * 0.2;
+                const sleepTime = current.cycleIntervalMs + this.randomBetween(-jitter, jitter);
+
                 if (tradeLamports <= 0) {
-                    await new Promise(resolve => setTimeout(resolve, current.cycleIntervalMs));
+                    await new Promise(resolve => setTimeout(resolve, Math.max(500, sleepTime)));
                     continue;
                 }
 
-                const cooldownMs = Math.max(500, current.walletCooldownMs);
-                let executedTrades = 0;
+            const cooldownMs = Math.max(500, current.walletCooldownMs);
+            let executedTrades = 0;
 
-                for (const action of cyclePattern) {
-                    const updated = this.getTasks(chatId).find(t => t.id === task.id);
-                    if (!updated || updated.status !== 'active') break;
+            for (const action of cyclePattern) {
+                const updated = this.getTasks(chatId).find(t => t.id === task.id);
+                if (!updated || updated.status !== 'active') break;
 
-                    const tradeNowMs = Date.now();
-                    if (updated.remainingBudgetLamports <= reserveLamports) break;
+                const tradeNowMs = Date.now();
+                if (updated.remainingBudgetLamports <= reserveLamports) break;
 
-                    if (action === 'buy') {
-                        const absoluteMinLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
-                        let currentTradeLamports = tradeLamports;
-                        let wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
-                        while (!wallet && currentTradeLamports > absoluteMinLamports) {
-                            currentTradeLamports = Math.floor(currentTradeLamports * 0.85);
-                            wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
-                        }
-                        if (!wallet) continue;
+                if (action === 'buy') {
+                    const absoluteMinLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
+                    let currentTradeLamports = tradeLamports;
+                    let wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
+                    while (!wallet && currentTradeLamports > absoluteMinLamports) {
+                        currentTradeLamports = Math.floor(currentTradeLamports * 0.85);
+                        wallet = await pickBuyWallet(currentTradeLamports, cooldownMs, tradeNowMs);
+                    }
+                    if (!wallet) continue;
                         const dexLower = (updated.poolDex ?? '').toLowerCase();
                         const useMeteora = dexLower.includes('meteora');
                         const useClmm = dexLower.includes('clmm');
@@ -1096,6 +1448,21 @@ class TelegramController {
                         this.usedWalletsByTaskId.set(updated.id, used);
                         updated.walletsUsed = used.size;
                         executedTrades += 1;
+
+                        // 60% chance to rotate tokens to another wallet for more organic footprint
+                        // Skip rotation for holders tasks to ensure they keep holding
+                        if (res && updated.type !== 'holders' && Math.random() < 0.6) {
+                            const recipient = await pickBuyWallet(0, cooldownMs, tradeNowMs);
+                            if (recipient && !recipient.publicKey.equals(wallet.publicKey)) {
+                                const bal = await bot.getTokenBalance(wallet.publicKey);
+                                if (bal > 0n) {
+                                    await bot.rotateToken(wallet, recipient, bal);
+                                    ensureMeta(recipient.publicKey.toBase58()).tokenAmount = bal;
+                                    ensureMeta(wallet.publicKey.toBase58()).tokenAmount = 0n;
+                                }
+                            }
+                        }
+
                         this.upsertTask(chatId, updated);
                     } else {
                         const wallet = await pickSellWallet(cooldownMs, tradeNowMs);
@@ -1103,7 +1470,23 @@ class TelegramController {
                         const id = wallet.publicKey.toBase58();
                         const tokenBal = await refreshTokenBalance(id, wallet.publicKey);
                         if (tokenBal <= 0n) continue;
-                        const sellAmount = tokenBal > 1n ? tokenBal / 2n : tokenBal;
+                        
+                        // Implement chunked selling for more organic footprint
+                        // If balance is significant, sometimes sell only a portion
+                        let sellPercent = this.randomBetween(0.98, 0.99); // Default: sell almost all
+                        
+                        // Estimate USD value of balance (rough estimate)
+                        const estSolValue = Number(tokenBal) / Number(bot.virtualTokenReserves || 1n) * Number(bot.virtualSolReserves || 1n) / LAMPORTS_PER_SOL;
+                        const estUsdValue = estSolValue * (safeSolUsd || 150);
+                        
+                        if (estUsdValue > 10 && Math.random() < 0.4) {
+                            // 40% chance to sell only a chunk ($2 - $8 worth) if balance > $10
+                            sellPercent = this.randomBetween(0.2, 0.5);
+                        }
+
+                        const sellAmount = BigInt(Math.floor(Number(tokenBal) * sellPercent));
+                        if (sellAmount <= 0n) continue;
+
                         const dexLower = (updated.poolDex ?? '').toLowerCase();
                         const useMeteora = dexLower.includes('meteora');
                         const useClmm = dexLower.includes('clmm');
@@ -1164,19 +1547,33 @@ class TelegramController {
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         const taskCount = Math.max(1, Math.floor(packageData.tasks));
         const solUsd = await this.getSolUsdPrice();
-        const totalBudgetLamports = Math.floor(packageData.sol * 0.6 * LAMPORTS_PER_SOL);
+        const feeRate = this.getServiceFeeRate(packageKey);
+        const totalBudgetLamports = Math.floor(packageData.sol * (1 - feeRate) * LAMPORTS_PER_SOL);
         const poolDexLower = (pool.dex || '').toLowerCase();
         const selectedFeeRate = this.getDexFeeRate(pool.dex);
-        const targetUsd = this.computeVolumeEstimateUsd(packageData.sol * 0.6, solUsd, selectedFeeRate);
-        const selectedDurationMs = this.parseDurationToMs(poolDexLower.includes('pump') ? durations.pump : durations.ray) ?? 0;
-        const pumpDurationMs = Math.floor(selectedDurationMs * 0.25);
-        const rayDurationMs = Math.max(0, selectedDurationMs - pumpDurationMs);
-        const pumpTargetUsd = targetUsd * 0.35;
-        const rayTargetUsd = Math.max(0, targetUsd - pumpTargetUsd);
+        const isMakers = packageKey.startsWith('makers');
+        const isHolders = packageKey.startsWith('holders');
+        const targetUsd = this.computeVolumeEstimateUsd(packageData.sol * (1 - feeRate), solUsd, selectedFeeRate);
+        const selectedDurationMs = this.parseDurationToMs(
+            isMakers || isHolders
+                ? (poolDexLower.includes('pump') ? packageData.pump_duration : packageData.ray_duration)
+                : (poolDexLower.includes('pump') ? durations.pump : durations.ray)
+        ) ?? 0;
+        const pumpDurationMs = selectedDurationMs;
+        const rayDurationMs = 0;
+        const pumpTargetUsd = isMakers || isHolders ? 0 : targetUsd;
+        const rayTargetUsd = 0;
         const buyRange = this.parseBuySizeRange(poolDexLower.includes('pump') ? packageData.pump_buy_size : packageData.ray_buy_size);
         const totalDesiredWallets = this.parseIntLike(poolDexLower.includes('pump') ? packageData.pump_makers : packageData.ray_makers) || 6;
-        const walletPoolSize = this.computeWalletPoolSize(totalBudgetLamports, totalDesiredWallets);
-        const perTaskBudgetLamports = Math.max(0, Math.floor(totalBudgetLamports / taskCount));
+        const effectiveBudgetLamports = Math.max(0, totalBudgetLamports - DefaultJitoTipAmountLamports - 50_000);
+        const walletPoolSize = this.computeWalletPoolSize(
+            effectiveBudgetLamports,
+            totalDesiredWallets,
+            isMakers,
+            isHolders,
+            isHolders ? buyRange.max : 0,
+        );
+        const perTaskBudgetLamports = Math.max(0, Math.floor(effectiveBudgetLamports / taskCount));
 
         const setupBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         await setupBot.getPumpData();
@@ -1192,9 +1589,9 @@ class TelegramController {
         await setupBot.extendLUT();
 
         const walletCount = setupBot.keypairs.length;
-        const effectiveBudgetLamports = Math.max(0, totalBudgetLamports - DefaultJitoTipAmountLamports - 50_000);
         if (walletCount > 0 && effectiveBudgetLamports > 0) {
-            const perWallet = Math.max(2_200_000, Math.floor(effectiveBudgetLamports / walletCount));
+            const minPerWallet = this.getMinimumLamportsPerWallet(isHolders, isHolders ? buyRange.max : 0);
+            const perWallet = Math.max(minPerWallet, Math.floor(effectiveBudgetLamports / walletCount));
             await setupBot.distributeSOLChunked(perWallet);
         }
 
@@ -1207,8 +1604,20 @@ class TelegramController {
             const group = groups[i];
             if (group.length === 0) continue;
             const nowMs = Date.now();
+            
+            let taskType: 'volume' | 'makers' | 'holders' = 'volume';
+            if (packageKey.startsWith('makers')) taskType = 'makers';
+            else if (packageKey.startsWith('holders')) taskType = 'holders';
+
+            const baseBuySol = Math.max(buyRange.min, buyRange.max);
+            const holdersBuyMinSol = Math.max(0.0001, baseBuySol * 0.6);
+            const holdersBuyMaxSol = Math.max(holdersBuyMinSol, baseBuySol * 1.4);
+            const taskBuyMinSol = taskType === 'holders' ? holdersBuyMinSol : buyRange.min;
+            const taskBuyMaxSol = taskType === 'holders' ? holdersBuyMaxSol : buyRange.max;
+
             const task: VolumeTask = {
                 id: `${Date.now()}_${i}_${Math.random().toString(16).slice(2)}`,
+                type: taskType,
                 status: 'active',
                 tokenAddress: ca,
                 tokenName,
@@ -1230,13 +1639,13 @@ class TelegramController {
                 pumpDurationMs,
                 rayTargetUsd,
                 rayDurationMs,
-                pumpBuyMinSol: buyRange.min,
-                pumpBuyMaxSol: buyRange.max,
-                rayBuyMinSol: buyRange.min,
-                rayBuyMaxSol: buyRange.max,
-                cycleIntervalMs: session.sleepMs,
+                pumpBuyMinSol: taskBuyMinSol,
+                pumpBuyMaxSol: taskBuyMaxSol,
+                rayBuyMinSol: taskBuyMinSol,
+                rayBuyMaxSol: taskBuyMaxSol,
+                cycleIntervalMs: taskType === 'volume' ? session.sleepMs : 3000, // Faster for boosters
                 remainingBudgetLamports: perTaskBudgetLamports,
-                walletCooldownMs: Math.max(2000, Math.floor(session.sleepMs * 0.6)),
+                walletCooldownMs: taskType === 'volume' ? Math.max(2000, Math.floor(session.sleepMs * 0.6)) : 1000,
             };
 
             const workerBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
@@ -1255,7 +1664,18 @@ class TelegramController {
     }
 
     private setupHandlers() {
-        this.bot.onText(/\/start/, async (msg) => { await this.showMainMenu(msg); });
+        this.bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => { 
+            const chatId = msg.chat.id;
+            const session = this.getSession(chatId);
+            const startArg = match?.[1];
+            if (startArg && !Number.isNaN(Number(startArg))) {
+                const refId = Number(startArg);
+                if (refId !== chatId) {
+                    session.referrerId = refId;
+                }
+            }
+            await this.showMainMenu(msg); 
+        });
         this.bot.onText(/\/volumebooster/, async (msg) => { await this.showVolumeBoosterMenu(msg); });
         this.bot.onText(/\/freetrial/, async (msg) => { await this.showFreeTrialEntry(msg); });
         this.bot.onText(/\/activetasks/, async (msg) => { await this.showActiveTasks(msg); });
@@ -1284,6 +1704,15 @@ class TelegramController {
                 await this.showFreeTrialPools(placeholder);
                 return;
             }
+            if (session.flow === 'REFERRALS') {
+                if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+                    (session as any).referral_wallet = text;
+                    await this.sendMessageWithRetry(chatId, `✅ Referral wallet set to: <code>${text}</code>\n\nYour referral link: <code>https://t.me/PegasusVolumeBot?start=${chatId}</code>\n\nYou will receive 10% of all fees generated by users who start the bot via your link.`, { parse_mode: 'HTML' });
+                } else {
+                    await this.sendMessageWithRetry(chatId, '❌ Invalid Solana address. Please send a valid SOL wallet address.');
+                }
+                return;
+            }
         });
 
         this.bot.on('callback_query', async (query) => {
@@ -1297,11 +1726,30 @@ class TelegramController {
             if (data === 'noop') return;
             if (data === 'back_to_main') { await this.showMainMenu(original); return; }
             if (data === 'volume_booster') { await this.showVolumeBoosterMenu(original); return; }
+            if (data === 'makers_booster') { await this.showMakersBoosterMenu(original); return; }
+            if (data === 'holders_booster') { await this.showHoldersBoosterMenu(original); return; }
             if (data === 'back_to_volume_menu') { await this.showVolumeBoosterMenu(original); return; }
             if (data === 'free_trial') { await this.showFreeTrialEntry(original); return; }
             if (data === 'volume_package_select') { session.volume_package = "2.5"; session.volume_duration = "20min|1h"; await this.showVolumePackageMenu(original); return; }
             if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
             if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('holders_') && data !== 'holders_continue') {
+                session.volume_package = data;
+                await this.showHoldersBoosterMenu(original);
+                return;
+            }
+            if (data === 'holders_continue') {
+                if (!session.volume_package.startsWith('holders_')) {
+                    session.volume_package = 'holders_500';
+                }
+                await this.showVolumeCaInput(original);
+                return;
+            }
+            if (data === 'booster_makers_30k') {
+                session.volume_package = 'makers_30k';
+                await this.showVolumeCaInput(original);
+                return;
+            }
             if (data === 'volume_continue') { await this.showVolumeOrderSummary(original); return; }
             if (data === 'back_to_volume_packages') { await this.showVolumePackageMenu(original); return; }
             if (data === 'volume_order_confirm') { await this.showVolumeCaInput(original); return; }
@@ -1317,42 +1765,53 @@ class TelegramController {
             }
             if (data === 'back_to_volume_pools') { await this.showVolumePools(original); return; }
             if (data === 'volume_payment') { await this.showVolumePayment(original); return; }
+            if (data === 'makers_payment') { await this.showMakersPayment(original); return; }
+            if (data === 'holders_payment') { await this.showHoldersPayment(original); return; }
             if (data === 'cancel_payment') {
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
+                session.paymentStartedAtMs = undefined;
                 await this.showVolumeBoosterMenu(original);
                 return;
             }
             if (data === 'check_payment') {
                 const expected = session.paymentExpectedLamports;
-                const startBal = session.paymentStartBalanceLamports;
-                if (expected === undefined || startBal === undefined) {
+                if (expected === undefined) {
                     await this.sendMessageWithRetry(chatId, '⚠️ Payment session not initialized. Please click "Pay Order" again.');
                     await this.showVolumeBoosterMenu(original);
                     return;
                 }
-                let currentBal: number | null = null;
+                const startBal = session.paymentStartBalanceLamports;
+                const sinceMs = session.paymentStartedAtMs ?? (Date.now() - 6 * 60 * 60 * 1000);
+                let paid = false;
                 try {
-                    currentBal = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+                    if (startBal !== undefined) {
+                        const currentBal = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+                        if (currentBal - startBal >= expected) paid = true;
+                    }
                 } catch {
-                    currentBal = null;
+                    paid = false;
                 }
-                if (currentBal === null) {
-                    await this.sendMessageWithRetry(chatId, '⚠️ Could not check payment right now. Please try again.');
-                    return;
+                if (!paid) {
+                    try {
+                        paid = await this.hasReceivedPayment(expected, sinceMs);
+                    } catch {
+                        paid = false;
+                    }
                 }
-                if (currentBal - startBal < expected) {
+                if (!paid) {
                     await this.sendMessageWithRetry(chatId, 'Payment not found yet. Please wait a few moments and try again.');
                     return;
                 }
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
+                session.paymentStartedAtMs = undefined;
                 try {
                     const packageKey = session.volume_package;
                     const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
-                    await this.deductFeeBeforeExecution(packageData.sol);
+                    await this.deductFeeBeforeExecution(chatId, packageData.sol);
                 } catch {
-                    await this.sendMessageWithRetry(chatId, '⚠️ Fee deduction failed (40%). Please ensure the main wallet has enough SOL and try again.');
+                    await this.sendMessageWithRetry(chatId, '⚠️ Fee deduction failed. Please ensure the main wallet has enough SOL and try again.');
                     return;
                 }
                 await this.activatePaidOrder(chatId);
@@ -1360,6 +1819,7 @@ class TelegramController {
                 return;
             }
 
+            if (data === 'back_to_main') { await this.showMainMenu(original); return; }
             if (data === 'active_tasks' || data === 'refresh_tasks') { await this.showActiveTasks(original); return; }
             if (data === 'view_stopped' || data === 'refresh_stopped') { await this.showStoppedTasks(original); return; }
             if (data === 'back_to_active_tasks') { await this.showActiveTasks(original); return; }
@@ -1439,12 +1899,12 @@ class TelegramController {
                 return;
             }
 
-            if (data === 'makers_booster') {
-                await this.sendMessageWithRetry(chatId, '⚡️ Makers Booster is not wired to this repo yet.');
-                return;
-            }
-            if (data === 'holders_booster') {
-                await this.sendMessageWithRetry(chatId, '🛡️ Holders Booster is not wired to this repo yet.');
+            if (data === 'makers_booster') { await this.showMakersBoosterMenu(original); return; }
+            if (data === 'holders_booster') { await this.showHoldersBoosterMenu(original); return; }
+
+            if (data.startsWith('booster_')) {
+                session.volume_package = data.replace('booster_', '');
+                await this.showVolumeCaInput(original);
                 return;
             }
         });
