@@ -34,6 +34,7 @@ const VOLUME_PACKAGES: Record<string, { sol: number; pump_volume: string; pump_d
     "12": { sol: 12.0, pump_volume: "$78.4K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "1,400", pump_reward: "$233-$744", ray_volume: "$433.6K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "9,800", tasks: 2 },
     "18": { sol: 18.0, pump_volume: "$117.6K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "2,800", pump_reward: "$349-$1116", ray_volume: "$650.4K", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "19,600", tasks: 4 },
     "36": { sol: 36.0, pump_volume: "$235.2K", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "5,600", pump_reward: "$697-$2232", ray_volume: "$1.30M", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "39,200", tasks: 8 },
+    "54": { sol: 54.0, pump_volume: "$0", pump_duration: "20min", pump_buy_size: "3.6/4.2 SOL", pump_makers: "8,400", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "3.6/4.2 SOL", ray_makers: "58,800", tasks: 12 },
     "makers_30k": { sol: 1.25, pump_volume: "$0", pump_duration: "2h", pump_buy_size: "0.0001 SOL", pump_makers: "30,000", pump_reward: "$0", ray_volume: "$0", ray_duration: "2h", ray_buy_size: "0.0001 SOL", ray_makers: "30,000", tasks: 1 },
     "holders_500": { sol: 1.5, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "500", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "500", tasks: 1 },
     "holders_1k": { sol: 3.0, pump_volume: "$0", pump_duration: "1h", pump_buy_size: "0.0003/0.0007 SOL", pump_makers: "1000", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.0003/0.0007 SOL", ray_makers: "1000", tasks: 1 },
@@ -679,16 +680,13 @@ class TelegramController {
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         const solUsd = await this.getSolUsdPrice();
         const executionBudgetSol = packageData.sol * (1 - this.getServiceFeeRate(packageKey));
-        const executionBudgetLamports = Math.floor(executionBudgetSol * LAMPORTS_PER_SOL);
         const pumpVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0125);
         const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
         const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : 'N/A';
         const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : 'N/A';
-        const pumpDesiredWallets = this.parseIntLike(packageData.pump_makers);
-        const rayDesiredWallets = this.parseIntLike(packageData.ray_makers);
-        const pumpWallets = this.computeWalletPoolSize(executionBudgetLamports, pumpDesiredWallets || 6, false, false);
-        const rayWallets = this.computeWalletPoolSize(executionBudgetLamports, rayDesiredWallets || 6, false, false);
-        const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${rayVolumeLabel}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWallets.toLocaleString()}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${pumpVolumeLabel}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWallets.toLocaleString()}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>`;
+        const pumpWalletsLabel = packageData.pump_makers || 'N/A';
+        const rayWalletsLabel = packageData.ray_makers || 'N/A';
+        const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🆓 36 & 54 SOL packages come with FREE Geckoterminal trending\n🆓 4.5 SOL and bigger packages come with FREE DEX reactions\n💸 30% cheaper than everyone else. Found cheaper? We'll beat it\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${rayVolumeLabel}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWalletsLabel}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${pumpVolumeLabel}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWalletsLabel}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol.toFixed(2)} SOL</b>`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
                 [{ text: '-----Choose Volume-----', callback_data: 'noop' }],
@@ -702,7 +700,10 @@ class TelegramController {
                     { text: '🦈 12 SOL', callback_data: 'package_12' },
                     { text: '🦈 18 SOL', callback_data: 'package_18' },
                 ],
-                [{ text: '🦈 36 SOL', callback_data: 'package_36' }],
+                [
+                    { text: '🐋 36 SOL', callback_data: 'package_36' },
+                    { text: '🐋 54 SOL', callback_data: 'package_54' },
+                ],
                 [{ text: '-----Set Duration-----', callback_data: 'noop' }],
                 [{ text: '💊20min|🟣1h', callback_data: 'duration_20min|1h' }],
                 [
@@ -735,7 +736,7 @@ class TelegramController {
         const rayVolumeUsd = this.computeVolumeEstimateUsd(executionBudgetSol, solUsd, 0.0025);
         const pumpVolumeLabel = solUsd ? this.formatCompactUsd(pumpVolumeUsd) : 'N/A';
         const rayVolumeLabel = solUsd ? this.formatCompactUsd(rayVolumeUsd) : 'N/A';
-        const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${rayVolumeLabel} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${pumpVolumeLabel} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
+        const text = `📋 <b>Your order summary:</b>\n\n<i>Confirm your selection below. You can pause, continue, or change CA anytime via /activetasks.</i>\n\n<b>🟣 Raydium:</b>\n━━━━━━━━━━━━━━━\n📈 ${rayVolumeLabel} • ⏳ ${durations.ray}\n\n<b>💊 Pumpfun/Pumpswap:</b>\n━━━━━━━━━━━━━━━\n📈 ${pumpVolumeLabel} • ⏳ ${durations.pump}\n\n🤖 Volume bots (tasks):<b> ${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol.toFixed(2)} SOL</b>\n\n🔽 <i>Confirm your order below, or press "Back" to edit settings.</i>`;
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
                 [{ text: '✅Continue', callback_data: 'volume_order_confirm' }],
@@ -1748,7 +1749,12 @@ class TelegramController {
             if (data === 'holders_booster') { await this.showHoldersBoosterMenu(original); return; }
             if (data === 'back_to_volume_menu') { await this.showVolumeBoosterMenu(original); return; }
             if (data === 'free_trial') { await this.showFreeTrialEntry(original); return; }
-            if (data === 'volume_package_select') { session.volume_package = "2.5"; session.volume_duration = "20min|1h"; await this.showVolumePackageMenu(original); return; }
+            if (data === 'volume_package_select') {
+                if (!session.volume_package) session.volume_package = "2.5";
+                if (!session.volume_duration) session.volume_duration = "20min|1h";
+                await this.showVolumePackageMenu(original);
+                return;
+            }
             if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
             if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; await this.showVolumePackageMenu(original); return; }
             if (data.startsWith('holders_') && data !== 'holders_continue') {
