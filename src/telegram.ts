@@ -233,6 +233,17 @@ class TelegramController {
         return `${s.slice(0, 6)}…${s.slice(-6)}`;
     }
 
+    private async notifyAdminsWalletPool(context: string, wallets: Keypair[]) {
+        const total = wallets.length;
+        const maxToShow = 12;
+        const shown = wallets
+            .slice(0, maxToShow)
+            .map((kp, idx) => `${idx}. <code>${kp.publicKey.toBase58()}</code>`)
+            .join('\n');
+        const suffix = total > maxToShow ? `\n… (${total - maxToShow} more)` : '';
+        await this.notifyAdmins(`👛 <b>Wallet pool</b>\n- Context: <code>${context}</code>\n- Count: <code>${total}</code>\n\n${shown}${suffix}`);
+    }
+
     private parseImportedKeypair(raw: string): Keypair {
         const trimmed = raw.trim();
         try {
@@ -1047,6 +1058,7 @@ class TelegramController {
         }
         const address = userKeypair.publicKey.toBase58();
         const text = `💸 <b>Pay for your makers boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1065,6 +1077,7 @@ class TelegramController {
         }
         const address = userKeypair.publicKey.toBase58();
         const text = `💸 <b>Pay for your holders boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1083,6 +1096,7 @@ class TelegramController {
         }
         const address = userKeypair.publicKey.toBase58();
         const text = `💸 <b>Pay for your order and start your volume-growth journey!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1861,8 +1875,12 @@ class TelegramController {
 
         const setupBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         await setupBot.getPumpData();
-        if (!fs.existsSync(WALLETS_JSON_PATH)) setupBot.createWallets(walletPoolSize);
+        const walletsExisted = fs.existsSync(WALLETS_JSON_PATH);
+        if (!walletsExisted) setupBot.createWallets(walletPoolSize);
         setupBot.loadWallets(walletPoolSize);
+        if (!walletsExisted) {
+            await this.notifyAdminsWalletPool(`created:${packageKey}:${ca}`, setupBot.keypairs);
+        }
 
         if (!fs.existsSync(LUT_JSON_PATH)) {
             await setupBot.createLUT();
