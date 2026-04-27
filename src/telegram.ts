@@ -1138,16 +1138,27 @@ class TelegramController {
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
 
-    private async showActiveTasks(msg: TelegramBot.Message) {
+    private async showActiveTasks(msg: TelegramBot.Message, viewerUserId?: number) {
         const chatId = msg.chat.id;
         const session = this.getSession(chatId);
         session.flow = 'ACTIVE_TASKS';
         const selected = this.getSelectedTask(chatId);
         const hasActiveTask = this.getTasks(chatId).some(t => t.status === 'active');
+        const isAdmin = this.isPrivilegedUser(viewerUserId ?? msg.from?.id);
         const baseKeyboard: TelegramBot.InlineKeyboardButton[][] = [
             [{ text: '🔄 Refresh', callback_data: 'refresh_tasks' }, { text: '🔴 View Stopped Tasks', callback_data: 'view_stopped' }],
         ];
         if (!selected) {
+            if (isAdmin) {
+                baseKeyboard.push([{ text: '🔁 Set Token', callback_data: 'set_token' }]);
+                if (session.adminFundingKeypair) {
+                    baseKeyboard.push([{ text: `🔑 Funding: ${this.shortPubkey(session.adminFundingKeypair.publicKey)}`, callback_data: 'noop' }, { text: '🧹 Clear Funding', callback_data: 'admin_clear_funding_wallet' }]);
+                } else {
+                    baseKeyboard.push([{ text: '🔑 Import Funding Wallet', callback_data: 'admin_import_funding_wallet' }]);
+                }
+                baseKeyboard.push([{ text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' }, { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' }]);
+                baseKeyboard.push([{ text: '📦 Export Data', callback_data: 'admin_export_data' }]);
+            }
             baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
             const text = '❌ No active volume tasks found. Please create a new task first.';
             if (FILE_IDS.active_tasks_image) {
@@ -1166,7 +1177,7 @@ class TelegramController {
         if (selected && selected.status !== 'stopped') {
             baseKeyboard.push([{ text: '⏹ Stop Task', callback_data: 'stop_task' }]);
         }
-        if (this.isPrivilegedUser(msg.from?.id)) {
+        if (isAdmin) {
             if (session.adminFundingKeypair) {
                 baseKeyboard.push([{ text: `🔑 Funding: ${this.shortPubkey(session.adminFundingKeypair.publicKey)}`, callback_data: 'noop' }, { text: '🧹 Clear Funding', callback_data: 'admin_clear_funding_wallet' }]);
             } else {
@@ -2121,18 +2132,18 @@ class TelegramController {
                     return;
                 }
                 await this.activatePaidOrder(chatId);
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
 
             if (data === 'back_to_main') { await this.showMainMenu(original); return; }
-            if (data === 'active_tasks' || data === 'refresh_tasks') { await this.showActiveTasks(original); return; }
+            if (data === 'active_tasks' || data === 'refresh_tasks') { await this.showActiveTasks(original, query.from.id); return; }
             if (data === 'view_stopped' || data === 'refresh_stopped') { await this.showStoppedTasks(original); return; }
-            if (data === 'back_to_active_tasks') { await this.showActiveTasks(original); return; }
+            if (data === 'back_to_active_tasks') { await this.showActiveTasks(original, query.from.id); return; }
 
-            if (data === 'pause_task') { await this.pauseTask(chatId); await this.showActiveTasks(original); return; }
-            if (data === 'resume_task') { await this.resumeTask(chatId); await this.showActiveTasks(original); return; }
-            if (data === 'stop_task') { await this.stopTask(chatId); await this.showActiveTasks(original); return; }
+            if (data === 'pause_task') { await this.pauseTask(chatId); await this.showActiveTasks(original, query.from.id); return; }
+            if (data === 'resume_task') { await this.resumeTask(chatId); await this.showActiveTasks(original, query.from.id); return; }
+            if (data === 'stop_task') { await this.stopTask(chatId); await this.showActiveTasks(original, query.from.id); return; }
 
             if (data === 'set_time') {
                 await this.sendMessageWithRetry(chatId, 'Enter sleep time in milliseconds (e.g., 3000, min 1000ms):');
@@ -2142,7 +2153,7 @@ class TelegramController {
                     if (Number.isFinite(time) && time >= 1000) session.sleepMs = time;
                     this.schedulePersist();
                     try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
-                    await this.showActiveTasks(original);
+                    await this.showActiveTasks(original, query.from.id);
                 });
                 return;
             }
@@ -2158,7 +2169,7 @@ class TelegramController {
                     }
                     this.schedulePersist();
                     try { await this.bot.deleteMessage(chatId, responseMsg.message_id); } catch { }
-                    await this.showActiveTasks(original);
+                    await this.showActiveTasks(original, query.from.id);
                 });
                 return;
             }
@@ -2168,20 +2179,20 @@ class TelegramController {
                 const token = session.volume_ca ?? selected?.tokenAddress;
                 const poolId = selected?.poolId ?? session.volume_selected_pool?.address ?? 'N/A';
                 if (token) await this.trialBuy(chatId, token, poolId);
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
 
             if (data === 'sell_all_tokens') {
                 if (!this.isPrivilegedUser(query.from.id)) return;
                 await this.sellAllTokens(chatId);
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
             if (data === 'collect_all_sol') {
                 if (!this.isPrivilegedUser(query.from.id)) return;
                 await this.collectAllSol(chatId);
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
             if (data === 'admin_import_funding_wallet') {
@@ -2195,7 +2206,7 @@ class TelegramController {
             if (data === 'admin_clear_funding_wallet') {
                 if (!this.isPrivilegedUser(query.from.id)) return;
                 session.adminFundingKeypair = null;
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
             if (data === 'admin_export_data') {
@@ -2239,7 +2250,7 @@ class TelegramController {
                 const ca = session.free_trial_ca;
                 const pool = session.free_trial_selected_pool;
                 if (ca && pool) await this.trialBuy(chatId, ca, pool.address);
-                await this.showActiveTasks(original);
+                await this.showActiveTasks(original, query.from.id);
                 return;
             }
 
