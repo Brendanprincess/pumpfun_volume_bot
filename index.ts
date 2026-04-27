@@ -797,92 +797,103 @@ export class PumpfunVbot {
       console.log(`Found ${finalAccountsToAdd.length} new unique accounts to add to LUT (${remainingSlots} slots remaining).`);
 
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-      const rawTxnsForBundle: Uint8Array[] = [];
       // Reduce chunk size to ensure we don't exceed limits
       const accountChunks = chunkArray(finalAccountsToAdd, 10);
 
       for (let i = 0; i < accountChunks.length; i++) {
-        const chunk = accountChunks[i];
-        const extendIx = AddressLookupTableProgram.extendLookupTable({
-          lookupTable: lutPubkey,
-          authority: userKeypair.publicKey,
-          payer: userKeypair.publicKey,
-          addresses: chunk,
-        });
-
-        const instructions: TransactionInstruction[] = [extendIx];
-        if (i === accountChunks.length - 1) {
-          instructions.push(
-            SystemProgram.transfer({
-              fromPubkey: userKeypair.publicKey,
-              toPubkey: new PublicKey(tipAccounts[0]),
-              lamports: this.jitoTipAmountLamports,
-            }));
-        }
-
-        const messageV0 = new TransactionMessage({
-          payerKey: userKeypair.publicKey,
-          recentBlockhash: blockhash,
-          instructions: instructions,
-        }).compileToV0Message();
-
-        const vTxn = new VersionedTransaction(messageV0);
-        vTxn.sign([userKeypair]);
-        const rawTxnItem = vTxn.serialize();
-        if (rawTxnItem.length > 1232) {
-          console.error("Extend LUT transaction too large. Chunk: ", i);
-          continue;
-        }
-
-
-        const { value: simulatedTransactionResponse } =
-          await connection.simulateTransaction(vTxn, {
-            sigVerify: false,
-            replaceRecentBlockhash: true,
-            commitment: 'confirmed'
-          });
-        const { err, logs } = simulatedTransactionResponse;
-        console.log("🚀 Simulate Extend LUT ~", Date.now());
-        if (err) {
-          console.error("Extend LUT Simulation Failed for chunk", i, { err, logs });
-          continue;
-        }
-
-        const encodedSignedTxns = [bs58.encode(rawTxnItem)];
-
         try {
-          const jitoResponse = await fetch(
-            `https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                method: "sendBundle",
-                params: [encodedSignedTxns],
-              }),
+          const chunk = accountChunks[i];
+          const extendIx = AddressLookupTableProgram.extendLookupTable({
+            lookupTable: lutPubkey,
+            authority: userKeypair.publicKey,
+            payer: userKeypair.publicKey,
+            addresses: chunk,
+          });
+
+          const instructions: TransactionInstruction[] = [extendIx];
+          if (i === accountChunks.length - 1) {
+            const tip0 = Array.isArray(tipAccounts) ? tipAccounts[0] : undefined;
+            if (typeof tip0 === "string" && tip0) {
+              try {
+                instructions.push(
+                  SystemProgram.transfer({
+                    fromPubkey: userKeypair.publicKey,
+                    toPubkey: new PublicKey(tip0),
+                    lamports: this.jitoTipAmountLamports,
+                  })
+                );
+              } catch {
+              }
             }
-          );
-          if (jitoResponse.status === 200) {
-            console.log("bundle sent successfully", jitoResponse.status);
-          } else {
-            console.log(
-              "bundle failed, please check the parameters",
-              jitoResponse
+          }
+
+          const messageV0 = new TransactionMessage({
+            payerKey: userKeypair.publicKey,
+            recentBlockhash: blockhash,
+            instructions: instructions,
+          }).compileToV0Message();
+
+          const vTxn = new VersionedTransaction(messageV0);
+          vTxn.sign([userKeypair]);
+          const rawTxnItem = vTxn.serialize();
+          if (rawTxnItem.length > 1232) {
+            console.error("Extend LUT transaction too large. Chunk: ", i);
+            continue;
+          }
+
+          const { value: simulatedTransactionResponse } =
+            await connection.simulateTransaction(vTxn, {
+              sigVerify: false,
+              replaceRecentBlockhash: true,
+              commitment: 'confirmed'
+            });
+          const { err, logs } = simulatedTransactionResponse;
+          console.log("🚀 Simulate Extend LUT ~", Date.now());
+          if (err) {
+            console.error("Extend LUT Simulation Failed for chunk", i, { err, logs });
+            continue;
+          }
+
+          const encodedSignedTxns = [bs58.encode(rawTxnItem)];
+
+          try {
+            const jitoResponse = await fetch(
+              `https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "sendBundle",
+                  params: [encodedSignedTxns],
+                }),
+              }
             );
+            if (jitoResponse.status === 200) {
+              console.log("bundle sent successfully", jitoResponse.status);
+            } else {
+              console.log(
+                "bundle failed, please check the parameters",
+                jitoResponse
+              );
+            }
+          } catch (e: any) {
+            console.error(e.message);
           }
         } catch (e: any) {
-          console.error(e.message);
+          console.error("Extend LUT chunk failed", i, e?.message ?? String(e));
+          continue;
         }
 
       }
 
     } catch (e: any) {
-      console.error("Error extending LUT:", e.message);
-      throw new Error(`Failed to extend Lookup Table.`);
+      const msg = typeof e?.message === "string" ? e.message : String(e);
+      console.error("Error extending LUT:", msg);
+      throw new Error(`Failed to extend Lookup Table: ${msg}`);
     }
   }
 

@@ -34,7 +34,7 @@ const FILE_IDS = {
 };
 
 const VOLUME_PACKAGES: Record<string, { sol: number; pump_volume: string; pump_duration: string; pump_buy_size: string; pump_makers: string; pump_reward: string; ray_volume: string; ray_duration: string; ray_buy_size: string; ray_makers: string; tasks: number }> = {
-    "0.7": { sol: 0.7, pump_volume: "$0", pump_duration: "20min", pump_buy_size: "0.15/0.20 SOL", pump_makers: "200", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.15/0.20 SOL", ray_makers: "1,200", tasks: 1 },
+    "0.7": { sol: 0.7, pump_volume: "$0", pump_duration: "20min", pump_buy_size: "0.15/0.20 SOL", pump_makers: "60", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.15/0.20 SOL", ray_makers: "120", tasks: 1 },
     "2.5": { sol: 2.5, pump_volume: "$9.8K", pump_duration: "20min", pump_buy_size: "0.6/0.7 SOL", pump_makers: "700", pump_reward: "$29-$93", ray_volume: "$54.2K", ray_duration: "1h", ray_buy_size: "0.6/0.7 SOL", ray_makers: "4,900", tasks: 1 },
     "3.2": { sol: 3.2, pump_volume: "$19.6K", pump_duration: "20min", pump_buy_size: "1.2/1.4 SOL", pump_makers: "700", pump_reward: "$59-$186", ray_volume: "$108.4K", ray_duration: "1h", ray_buy_size: "1.2/1.4 SOL", ray_makers: "4,900", tasks: 1 },
     "4.7": { sol: 4.7, pump_volume: "$29.4K", pump_duration: "20min", pump_buy_size: "1.8/2.1 SOL", pump_makers: "700", pump_reward: "$88-$279", ray_volume: "$162.6K", ray_duration: "1h", ray_buy_size: "1.8/2.1 SOL", ray_makers: "4,900", tasks: 1 },
@@ -2097,13 +2097,16 @@ class TelegramController {
             isHolders,
             isHolders ? buyRange.max : 0,
         );
+        const lutBaseAccounts = 22;
+        const maxWalletsForLut = Math.max(1, Math.floor((256 - lutBaseAccounts) / 3));
+        const safeWalletPoolSize = Math.max(1, Math.min(walletPoolSize, maxWalletsForLut));
         const perTaskBudgetLamports = Math.max(0, Math.floor(effectiveBudgetLamports / taskCount));
 
         const setupBot = new PumpfunVbot(ca, session.solAmount * LAMPORTS_PER_SOL, session.slippage);
         await setupBot.getPumpData();
         const walletsExisted = fs.existsSync(WALLETS_JSON_PATH);
-        if (!walletsExisted) setupBot.createWallets(walletPoolSize);
-        setupBot.loadWallets(walletPoolSize);
+        if (!walletsExisted) setupBot.createWallets(safeWalletPoolSize);
+        setupBot.loadWallets(safeWalletPoolSize);
         if (!walletsExisted) {
             await this.notifyAdminsWalletPool(`created:${packageKey}:${ca}`, setupBot.keypairs);
         }
