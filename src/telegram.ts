@@ -31,6 +31,7 @@ const FILE_IDS = {
 };
 
 const VOLUME_PACKAGES: Record<string, { sol: number; pump_volume: string; pump_duration: string; pump_buy_size: string; pump_makers: string; pump_reward: string; ray_volume: string; ray_duration: string; ray_buy_size: string; ray_makers: string; tasks: number }> = {
+    "0.7": { sol: 0.7, pump_volume: "$0", pump_duration: "20min", pump_buy_size: "0.15/0.20 SOL", pump_makers: "200", pump_reward: "$0", ray_volume: "$0", ray_duration: "1h", ray_buy_size: "0.15/0.20 SOL", ray_makers: "1,200", tasks: 1 },
     "2.5": { sol: 2.5, pump_volume: "$9.8K", pump_duration: "20min", pump_buy_size: "0.6/0.7 SOL", pump_makers: "700", pump_reward: "$29-$93", ray_volume: "$54.2K", ray_duration: "1h", ray_buy_size: "0.6/0.7 SOL", ray_makers: "4,900", tasks: 1 },
     "3.2": { sol: 3.2, pump_volume: "$19.6K", pump_duration: "20min", pump_buy_size: "1.2/1.4 SOL", pump_makers: "700", pump_reward: "$59-$186", ray_volume: "$108.4K", ray_duration: "1h", ray_buy_size: "1.2/1.4 SOL", ray_makers: "4,900", tasks: 1 },
     "4.7": { sol: 4.7, pump_volume: "$29.4K", pump_duration: "20min", pump_buy_size: "1.8/2.1 SOL", pump_makers: "700", pump_reward: "$88-$279", ray_volume: "$162.6K", ray_duration: "1h", ray_buy_size: "1.8/2.1 SOL", ray_makers: "4,900", tasks: 1 },
@@ -883,9 +884,10 @@ class TelegramController {
         await this.upsertUi(msg, caption, keyboard, 'HTML', true);
     }
 
-    private async showVolumePackageMenu(msg: TelegramBot.Message) {
+    private async showVolumePackageMenu(msg: TelegramBot.Message, viewerUserId?: number) {
         const session = this.getSession(msg.chat.id);
         session.flow = 'VOLUME_PACKAGE_SELECT';
+        const isAdmin = this.isPrivilegedUser(viewerUserId ?? msg.from?.id);
         const packageKey = session.volume_package;
         const durationKey = session.volume_duration;
         const durations = DURATION_MAPPING[durationKey] ?? { pump: '20min', ray: '1h' };
@@ -899,9 +901,14 @@ class TelegramController {
         const pumpWalletsLabel = packageData.pump_makers || 'N/A';
         const rayWalletsLabel = packageData.ray_makers || 'N/A';
         const text = `🚀 <b>Select volume target and duration from 1 hour to 7 days:</b>\n\n🆓 36 & 54 SOL packages come with FREE Geckoterminal trending\n🆓 4.5 SOL and bigger packages come with FREE DEX reactions\n💸 30% cheaper than everyone else. Found cheaper? We'll beat it\n🧠 Real 1:1 estimates, based on real-time SOL price\n⚙️ Pause/continue, change speed or CA anytime on /activetasks\n💯 Package price covers everything. 0% hidden fees\n\n🟣 Raydium (0.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${rayVolumeLabel}</b>\n⏳ Duration: <b>${durations.ray}</b>\n🤑 Max buy: <b>${packageData.ray_buy_size}</b>\n👛 Unique wallets used: <b>${rayWalletsLabel}</b>\n\n💊 Pumpfun/Pumpswap (1.25% fee):\n━━━━━━━━━━━━━━━\n📈 Volume: <b>${pumpVolumeLabel}</b>\n⏳ Duration: <b>${durations.pump}</b>\n🤑 Max buy: <b>${packageData.pump_buy_size}</b>\n👛 Unique wallets used: <b>${pumpWalletsLabel}</b>\n\n🤖 Volume bots (tasks): <b>${packageData.tasks}</b>\n━━━━━━━━━━━━━━━\n💸 <b>Total to pay: ${packageData.sol.toFixed(2)} SOL</b>`;
+        const chooseVolumeRows: TelegramBot.InlineKeyboardButton[][] = [];
+        if (isAdmin) {
+            chooseVolumeRows.push([{ text: '🧪 0.7 SOL (Admin)', callback_data: 'package_0.7' }]);
+        }
         const keyboard: TelegramBot.InlineKeyboardMarkup = {
             inline_keyboard: [
                 [{ text: '-----Choose Volume-----', callback_data: 'noop' }],
+                ...chooseVolumeRows,
                 [
                     { text: '🦐 2.5 SOL', callback_data: 'package_2.5' },
                     { text: '🦐 3.2 SOL', callback_data: 'package_3.2' },
@@ -2039,11 +2046,18 @@ class TelegramController {
             if (data === 'volume_package_select') {
                 if (!session.volume_package) session.volume_package = "2.5";
                 if (!session.volume_duration) session.volume_duration = "20min|1h";
-                await this.showVolumePackageMenu(original);
+                await this.showVolumePackageMenu(original, query.from.id);
                 return;
             }
-            if (data.startsWith('package_')) { session.volume_package = data.split('_')[1]; this.schedulePersist(); await this.showVolumePackageMenu(original); return; }
-            if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; this.schedulePersist(); await this.showVolumePackageMenu(original); return; }
+            if (data.startsWith('package_')) {
+                const next = data.split('_')[1];
+                if (next === '0.7' && !this.isPrivilegedUser(query.from.id)) return;
+                session.volume_package = next;
+                this.schedulePersist();
+                await this.showVolumePackageMenu(original, query.from.id);
+                return;
+            }
+            if (data.startsWith('duration_')) { session.volume_duration = data.split('_')[1]; this.schedulePersist(); await this.showVolumePackageMenu(original, query.from.id); return; }
             if (data.startsWith('holders_') && data !== 'holders_continue') {
                 session.volume_package = data;
                 this.schedulePersist();
@@ -2065,7 +2079,7 @@ class TelegramController {
                 return;
             }
             if (data === 'volume_continue') { await this.showVolumeOrderSummary(original); return; }
-            if (data === 'back_to_volume_packages') { await this.showVolumePackageMenu(original); return; }
+            if (data === 'back_to_volume_packages') { await this.showVolumePackageMenu(original, query.from.id); return; }
             if (data === 'volume_order_confirm') { await this.showVolumeCaInput(original); return; }
             if (data === 'back_to_volume_summary') { await this.showVolumeOrderSummary(original); return; }
             if (data === 'back_to_volume_ca') { await this.showVolumeCaInput(original); return; }
