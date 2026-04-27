@@ -2441,7 +2441,14 @@ class TelegramController {
                     await this.sendMessageWithRetry(chatId, '⚠️ Fee deduction failed. Please ensure the main wallet has enough SOL and try again.');
                     return;
                 }
-                await this.activatePaidOrder(chatId);
+                try {
+                    await this.activatePaidOrder(chatId);
+                } catch (e: any) {
+                    const msgText = typeof e?.message === 'string' ? e.message : String(e);
+                    await this.notifyAdmins(`❌ <b>activatePaidOrder failed</b>\n- Chat: <code>${chatId}</code>\n- Error: <code>${msgText}</code>`);
+                    await this.sendMessageWithRetry(chatId, '⚠️ Order setup failed after payment. Payment was received, but the bot could not start the service. Please contact support.');
+                    return;
+                }
                 await this.showActiveTasks(original, query.from.id);
                 return;
             }

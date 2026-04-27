@@ -707,9 +707,11 @@ export class PumpfunVbot {
       if (!this.keypairs || this.keypairs.length === 0) {
         this.loadWallets();
       }
-      if (!this.mint || !this.bondingCurve) {
+      if (!this.mint || !this.bondingCurve || !this.associatedBondingCurve) {
         await this.getPumpData();
-        if (!this.mint || !this.bondingCurve) throw new Error("Cannot extend LUT: Mint CA or bonding curve data not loaded.");
+        if (!this.mint || !this.bondingCurve || !this.associatedBondingCurve) {
+          throw new Error("Cannot extend LUT: Pump.fun accounts not loaded (mint/bondingCurve/associatedBondingCurve).");
+        }
       }
 
       console.log(`Preparing to add up to ${this.keypairs.length} sub-wallets and their ATAs to LUT.`);
@@ -723,26 +725,54 @@ export class PumpfunVbot {
         userKeypair.publicKey
       );
 
-      let accountsToAddSet = new Set<string>();
+      const accountsToAddSet = new Set<string>();
+      const add = (acc: PublicKey | null | undefined) => {
+        if (!acc) return;
+        accountsToAddSet.add(acc.toBase58());
+      };
 
-      [userKeypair.publicKey, ataTokenPayer, ataWSOLPayer, this.mint,
-      this.bondingCurve, this.associatedBondingCurve, RENT, GLOBAL, FEE_RECIPIENT,
-        SYSTEM_PROGRAM_ID, ASSOC_TOKEN_ACC_PROG, spl.TOKEN_PROGRAM_ID, PUMP_FUN_ACCOUNT,
-        PUMP_FUN_PROGRAM, ...tipAccounts.map(ta => new PublicKey(ta))
-      ].forEach(acc => accountsToAddSet.add(acc.toBase58()));
+      [
+        userKeypair.publicKey,
+        ataTokenPayer,
+        ataWSOLPayer,
+        this.mint,
+        this.bondingCurve,
+        this.associatedBondingCurve,
+        RENT,
+        GLOBAL,
+        FEE_RECIPIENT,
+        SYSTEM_PROGRAM_ID,
+        ASSOC_TOKEN_ACC_PROG,
+        spl.TOKEN_PROGRAM_ID,
+        PUMP_FUN_ACCOUNT,
+        PUMP_FUN_PROGRAM,
+      ].forEach(add);
+
+      if (Array.isArray(tipAccounts)) {
+        for (const ta of tipAccounts) {
+          if (typeof ta !== "string" || !ta) continue;
+          try {
+            add(new PublicKey(ta));
+          } catch {
+          }
+        }
+      }
 
       for (const keypair of this.keypairs) {
-        const ataToken = await spl.getAssociatedTokenAddress(
-          this.mint,
-          keypair.publicKey
-        );
-        const ataWSOL = await spl.getAssociatedTokenAddress(
-          spl.NATIVE_MINT,
-          keypair.publicKey
-        );
-        accountsToAddSet.add(keypair.publicKey.toBase58());
-        accountsToAddSet.add(ataToken.toBase58());
-        accountsToAddSet.add(ataWSOL.toBase58());
+        try {
+          const ataToken = await spl.getAssociatedTokenAddress(
+            this.mint,
+            keypair.publicKey
+          );
+          const ataWSOL = await spl.getAssociatedTokenAddress(
+            spl.NATIVE_MINT,
+            keypair.publicKey
+          );
+          add(keypair.publicKey);
+          add(ataToken);
+          add(ataWSOL);
+        } catch {
+        }
       }
 
       const existingAddresses = new Set(this.lookupTableAccount.state.addresses.map(addr => addr.toBase58()));
