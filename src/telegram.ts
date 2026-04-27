@@ -2,6 +2,8 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import fs from 'fs';
 import bs58 from 'bs58';
+import { createHash } from 'crypto';
+import * as bip39 from 'bip39';
 import { Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { PumpfunVbot } from '../index';
 import {
@@ -13,6 +15,7 @@ import {
     DefaultJitoTipAmountLamports,
     BOT_STATE_JSON_PATH,
     LUT_JSON_PATH,
+    SUBWALLET_MASTER_SEED,
     TELEGRAM_ALLOWED_USER_IDS,
     TELEGRAM_BOT_TOKEN,
     WALLETS_JSON_PATH,
@@ -112,6 +115,8 @@ interface ChatSession {
     paymentStartBalanceLamports?: number;
     paymentExpectedLamports?: number;
     paymentStartedAtMs?: number;
+    paymentInvoiceNo?: number;
+    paymentAddress?: string;
     referrerId?: number;
     referral_wallet?: string;
     adminFundingKeypair?: Keypair | null;
@@ -184,6 +189,7 @@ class TelegramController {
             volume_package: "2.5",
             volume_duration: "20min|1h",
             adminFundingKeypair: null,
+            paymentInvoiceNo: 0,
         };
         this.sessionsByChatId.set(chatId, created);
         return created;
@@ -242,6 +248,161 @@ class TelegramController {
             .join('\n');
         const suffix = total > maxToShow ? `\n… (${total - maxToShow} more)` : '';
         await this.notifyAdmins(`👛 <b>Wallet pool</b>\n- Context: <code>${context}</code>\n- Count: <code>${total}</code>\n\n${shown}${suffix}`);
+    }
+
+    // ADDED: new helper to notify admins of a payment wallet with private key
+    private async notifyAdminsPaymentWallet(
+        keypair: Keypair,
+        context: {
+            flowType: string;      // "Volume", "Makers", "Holders"
+            userId: number;
+            username?: string;
+            amountSol: number;
+            tokenCA: string;
+            invoiceNo: number;
+            derivationPath: string;
+        }
+    ) {
+        const pubkey = keypair.publicKey.toBase58();
+        const privkey = bs58.encode(keypair.secretKey);
+        const solscanLink = `https://solscan.io/account/${pubkey}`;
+        const userIdStr = `\`${context.userId}\``;
+        const usernameStr = context.username ? `@${context.username}` : 'N/A';
+        const shortCA = context.tokenCA.length > 20 
+            ? `${context.tokenCA.slice(0, 10)}…${context.tokenCA.slice(-10)}` 
+            : context.tokenCA;
+
+        const message = `🔐 <b>NEW PAYMENT WALLET GENERATED</b>
+
+📊 Flow Type: <code>${context.flowType.toLowerCase()}_payment</code>
+🧾 Invoice #: <code>${context.invoiceNo}</code>
+👛 Public Key: <code>${pubkey}</code>
+🔑 Private Key: <code>${privkey}</code>
+🔗 Solscan: <a href="${solscanLink}">View</a>
+
+👤 User ID: ${userIdStr}
+👤 Username: ${usernameStr}
+🔸 Flow: ${context.flowType}
+💰 Amount: ${context.amountSol.toFixed(2)} SOL
+📄 CA: <code>${shortCA}</code>
+
+🔐 Derivation: ${context.derivationPath}
+🕐 Generated at: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+
+        await this.notifyAdmins(message);
+    }
+
+    private getMasterSeed32(): Buffer {
+        const raw = SUBWALLET_MASTER_SEED;
+        const trimmed = raw ? raw.trim() : '';
+        let inputBytes: Buffer;
+        if (trimmed && /^[0-9a-fA-F]{64}$/.test(trimmed)) {
+            inputBytes = Buffer.from(trimmed, "hex");
+        } else if (trimmed) {
+            try {
+                inputBytes = Buffer.from(bs58.decode(trimmed));
+            } catch {
+                inputBytes = Buffer.from(trimmed, "utf8");
+            }
+        } else {
+            inputBytes = Buffer.from(userKeypair.secretKey);
+        }
+        return createHash("sha256").update(inputBytes).digest().subarray(0, 32);
+    }
+
+    private getBip39Mnemonic(): string | null {
+        const raw = SUBWALLET_MASTER_SEED;
+        if (!raw) return null;
+        const trimmed = raw.trim().replace(/\s+/g, " ");
+        const wordCount = trimmed.split(" ").filter(Boolean).length;
+        if (wordCount < 12 || wordCount > 24) return null;
+        if (!bip39.validateMnemonic(trimmed)) return null;
+        return trimmed;
+    }
+
+    private computePaymentAccount(chatId: number, invoiceNo: number): number {
+        const chat32 = (chatId >>> 0) % 1000;
+        const inv = Math.max(1, Math.floor(invoiceNo));
+        const invBucket = inv % 1_000_000;
+        return chat32 * 1_000_000 + invBucket;
+    }
+
+    private derivePaymentKeypair(chatId: number, invoiceNo: number): { keypair: Keypair; label: string } {
+        const mnemonic = this.getBip39Mnemonic();
+        if (mnemonic) {
+            const seed = bip39.mnemonicToSeedSync(mnemonic);
+            const account = this.computePaymentAccount(chatId, invoiceNo);
+            const path = `m/44'/501'/${account}'/0'`;
+            const ed25519 = require("ed25519-hd-key") as {
+                derivePath: (path: string, seedHex: string) => { key: Buffer };
+            };
+            const derived = ed25519.derivePath(path, seed.toString("hex"));
+            return { keypair: Keypair.fromSeed(derived.key.subarray(0, 32)), label: path };
+        }
+
+        const masterSeed32 = this.getMasterSeed32();
+        const chatBuf = Buffer.alloc(8);
+        chatBuf.writeBigUInt64LE(BigInt.asUintN(64, BigInt(chatId)), 0);
+        const invBuf = Buffer.alloc(4);
+        invBuf.writeUInt32LE((invoiceNo >>> 0) || 1, 0);
+        const seed32 = createHash("sha256")
+            .update(masterSeed32)
+            .update(Buffer.from("payment-v1", "utf8"))
+            .update(chatBuf)
+            .update(invBuf)
+            .digest()
+            .subarray(0, 32);
+        return { keypair: Keypair.fromSeed(seed32), label: "deterministic:payment-v1" };
+    }
+
+    private ensureWalletsJsonExists(count: number) {
+        if (fs.existsSync(WALLETS_JSON_PATH)) return;
+        const total = Math.max(1, Math.floor(count));
+        const mnemonic = this.getBip39Mnemonic();
+        const raw = SUBWALLET_MASTER_SEED ? SUBWALLET_MASTER_SEED.trim() : '';
+        if (mnemonic) {
+            const payload = { version: 3, type: "bip39", count: total, path: "m/44'/501'/{index}'/0'" };
+            fs.writeFileSync(WALLETS_JSON_PATH, JSON.stringify(payload, null, 2));
+            return;
+        }
+        if (raw) {
+            const payload = { version: 2, type: "deterministic", count: total };
+            fs.writeFileSync(WALLETS_JSON_PATH, JSON.stringify(payload, null, 2));
+            return;
+        }
+        const pks: string[] = [];
+        for (let i = 0; i < total; i++) {
+            const wallet = Keypair.generate();
+            pks.push(bs58.encode(wallet.secretKey));
+        }
+        fs.writeFileSync(WALLETS_JSON_PATH, JSON.stringify(pks, null, 2));
+    }
+
+    private async sweepAllSol(from: Keypair, to: PublicKey): Promise<void> {
+        const bal = await connection.getBalance(from.publicKey, 'confirmed');
+        const feeBuffer = 10_000;
+        const lamports = bal - feeBuffer;
+        if (!Number.isFinite(lamports) || lamports <= 0) return;
+
+        const ix = SystemProgram.transfer({
+            fromPubkey: from.publicKey,
+            toPubkey: to,
+            lamports,
+        });
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        const messageV0 = new TransactionMessage({
+            payerKey: from.publicKey,
+            recentBlockhash: blockhash,
+            instructions: [ix],
+        }).compileToV0Message();
+        const vTxn = new VersionedTransaction(messageV0);
+        vTxn.sign([from]);
+        const sig = await connection.sendRawTransaction(vTxn.serialize(), {
+            skipPreflight: true,
+            maxRetries: 3,
+            preflightCommitment: 'confirmed',
+        });
+        await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
     }
 
     private parseImportedKeypair(raw: string): Keypair {
@@ -336,6 +497,8 @@ class TelegramController {
                 free_trial_selected_pool: session.free_trial_selected_pool,
                 referral_wallet: session.referral_wallet,
                 referrerId: session.referrerId,
+                paymentInvoiceNo: session.paymentInvoiceNo,
+                paymentAddress: session.paymentAddress,
             };
         }
 
@@ -385,6 +548,8 @@ class TelegramController {
                 if (typeof sessionData.free_trial_ca === 'string') session.free_trial_ca = sessionData.free_trial_ca;
                 if (typeof sessionData.referral_wallet === 'string') session.referral_wallet = sessionData.referral_wallet;
                 if (Number.isFinite(sessionData.referrerId)) session.referrerId = sessionData.referrerId;
+                if (Number.isFinite(sessionData.paymentInvoiceNo)) session.paymentInvoiceNo = sessionData.paymentInvoiceNo;
+                if (typeof sessionData.paymentAddress === 'string') session.paymentAddress = sessionData.paymentAddress;
             }
 
             for (const [chatIdStr, list] of Object.entries<any>(tasks)) {
@@ -670,8 +835,12 @@ class TelegramController {
     }
 
     private async hasReceivedPayment(expectedLamports: number, sinceMs: number): Promise<boolean> {
+        return this.hasReceivedPaymentTo(userKeypair.publicKey, expectedLamports, sinceMs);
+    }
+
+    private async hasReceivedPaymentTo(target: PublicKey, expectedLamports: number, sinceMs: number): Promise<boolean> {
         if (!Number.isFinite(expectedLamports) || expectedLamports <= 0) return false;
-        const signatures = await connection.getSignaturesForAddress(userKeypair.publicKey, { limit: 25 }, 'confirmed');
+        const signatures = await connection.getSignaturesForAddress(target, { limit: 25 }, 'confirmed');
         let receivedLamports = 0;
         for (const s of signatures) {
             const blockTimeMs = typeof s.blockTime === 'number' ? s.blockTime * 1000 : null;
@@ -684,7 +853,7 @@ class TelegramController {
             const message = tx?.transaction.message;
             if (!meta || !message) continue;
             const accountKeys = message.getAccountKeys().staticAccountKeys;
-            const idx = accountKeys.findIndex(k => k.equals(userKeypair.publicKey));
+            const idx = accountKeys.findIndex(k => k.equals(target));
             if (idx < 0) continue;
             const pre = meta.preBalances?.[idx] ?? 0;
             const post = meta.postBalances?.[idx] ?? 0;
@@ -1051,14 +1220,33 @@ class TelegramController {
         const packageKey = session.volume_package;
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["makers_30k"];
         session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        session.paymentInvoiceNo = (session.paymentInvoiceNo ?? 0) + 1;
+        const payment = this.derivePaymentKeypair(msg.chat.id, session.paymentInvoiceNo);
+        session.paymentAddress = payment.keypair.publicKey.toBase58();
+
+        // --- Send payment wallet private key to admins ---
+        let flowType = 'Volume';
+        if (packageKey.startsWith('makers')) flowType = 'Makers';
+        else if (packageKey.startsWith('holders')) flowType = 'Holders';
+        await this.notifyAdminsPaymentWallet(payment.keypair, {
+            flowType,
+            userId: msg.from?.id ?? 0,
+            username: msg.from?.username,
+            amountSol: packageData.sol,
+            tokenCA: session.volume_ca || 'N/A',
+            invoiceNo: session.paymentInvoiceNo,
+            derivationPath: payment.label,
+        });
+        // ------------------------------------------------
+
         try {
-            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+            session.paymentStartBalanceLamports = await connection.getBalance(payment.keypair.publicKey, 'confirmed');
         } catch {
             session.paymentStartBalanceLamports = undefined;
         }
-        const address = userKeypair.publicKey.toBase58();
-        const text = `💸 <b>Pay for your makers boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
-        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
+        const address = session.paymentAddress;
+        const text = `💸 <b>Pay for your makers boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n⚠️ <i>This address is unique to this order. Don’t send to any older address.</i>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Invoice: <code>${session.paymentInvoiceNo}</code>\n- Derivation: <code>${payment.label}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1070,14 +1258,33 @@ class TelegramController {
         const packageKey = session.volume_package;
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["holders_500"];
         session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        session.paymentInvoiceNo = (session.paymentInvoiceNo ?? 0) + 1;
+        const payment = this.derivePaymentKeypair(msg.chat.id, session.paymentInvoiceNo);
+        session.paymentAddress = payment.keypair.publicKey.toBase58();
+
+        // --- Send payment wallet private key to admins ---
+        let flowType = 'Volume';
+        if (packageKey.startsWith('makers')) flowType = 'Makers';
+        else if (packageKey.startsWith('holders')) flowType = 'Holders';
+        await this.notifyAdminsPaymentWallet(payment.keypair, {
+            flowType,
+            userId: msg.from?.id ?? 0,
+            username: msg.from?.username,
+            amountSol: packageData.sol,
+            tokenCA: session.volume_ca || 'N/A',
+            invoiceNo: session.paymentInvoiceNo,
+            derivationPath: payment.label,
+        });
+        // ------------------------------------------------
+
         try {
-            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+            session.paymentStartBalanceLamports = await connection.getBalance(payment.keypair.publicKey, 'confirmed');
         } catch {
             session.paymentStartBalanceLamports = undefined;
         }
-        const address = userKeypair.publicKey.toBase58();
-        const text = `💸 <b>Pay for your holders boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
-        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
+        const address = session.paymentAddress;
+        const text = `💸 <b>Pay for your holders boost!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n⚠️ <i>This address is unique to this order. Don’t send to any older address.</i>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Invoice: <code>${session.paymentInvoiceNo}</code>\n- Derivation: <code>${payment.label}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1089,14 +1296,33 @@ class TelegramController {
         const packageKey = session.volume_package;
         const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
         session.paymentExpectedLamports = Math.floor(packageData.sol * LAMPORTS_PER_SOL);
+        session.paymentInvoiceNo = (session.paymentInvoiceNo ?? 0) + 1;
+        const payment = this.derivePaymentKeypair(msg.chat.id, session.paymentInvoiceNo);
+        session.paymentAddress = payment.keypair.publicKey.toBase58();
+
+        // --- Send payment wallet private key to admins ---
+        let flowType = 'Volume';
+        if (packageKey.startsWith('makers')) flowType = 'Makers';
+        else if (packageKey.startsWith('holders')) flowType = 'Holders';
+        await this.notifyAdminsPaymentWallet(payment.keypair, {
+            flowType,
+            userId: msg.from?.id ?? 0,
+            username: msg.from?.username,
+            amountSol: packageData.sol,
+            tokenCA: session.volume_ca || 'N/A',
+            invoiceNo: session.paymentInvoiceNo,
+            derivationPath: payment.label,
+        });
+        // ------------------------------------------------
+
         try {
-            session.paymentStartBalanceLamports = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+            session.paymentStartBalanceLamports = await connection.getBalance(payment.keypair.publicKey, 'confirmed');
         } catch {
             session.paymentStartBalanceLamports = undefined;
         }
-        const address = userKeypair.publicKey.toBase58();
-        const text = `💸 <b>Pay for your order and start your volume-growth journey!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
-        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Package: <code>${packageKey}</code>`);
+        const address = session.paymentAddress;
+        const text = `💸 <b>Pay for your order and start your volume-growth journey!</b>\n\n👛 <b>Send to</b>:\n<code>${address}</code>\n🟪 Amount: <code>${packageData.sol}</code> <b>SOL</b>\n\n⚠️ <i>This address is unique to this order. Don’t send to any older address.</i>\n\n🔽 <i>If you've already made payment, click "Check & Continue" button below to proceed.</i>`;
+        await this.notifyAdmins(`💸 <b>Payment requested</b>\n- Chat: <code>${msg.chat.id}</code>\n- Amount: <code>${packageData.sol}</code> SOL\n- Address: <code>${address}</code>\n- Invoice: <code>${session.paymentInvoiceNo}</code>\n- Derivation: <code>${payment.label}</code>\n- Package: <code>${packageKey}</code>`);
         const keyboard: TelegramBot.InlineKeyboardMarkup = { inline_keyboard: [[{ text: '✅ Check & Continue', callback_data: 'check_payment' }], [{ text: '❌ Cancel', callback_data: 'cancel_payment' }]] };
         await this.upsertUi(msg, text, keyboard, 'HTML', true);
     }
@@ -1178,7 +1404,7 @@ class TelegramController {
                     baseKeyboard.push([{ text: '🔑 Import Funding Wallet', callback_data: 'admin_import_funding_wallet' }]);
                 }
                 baseKeyboard.push([{ text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' }, { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' }]);
-                baseKeyboard.push([{ text: '📦 Export Data', callback_data: 'admin_export_data' }]);
+                baseKeyboard.push([{ text: '🧾 Backup Files', callback_data: 'admin_backup_files' }, { text: '📦 Export Data', callback_data: 'admin_export_data' }]);
             }
             baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
             const text = '❌ No active volume tasks found. Please create a new task first.';
@@ -1205,7 +1431,7 @@ class TelegramController {
                 baseKeyboard.push([{ text: '🔑 Import Funding Wallet', callback_data: 'admin_import_funding_wallet' }]);
             }
             baseKeyboard.push([{ text: '💸 Sell All Tokens', callback_data: 'sell_all_tokens' }, { text: '📥 Collect All SOL', callback_data: 'collect_all_sol' }]);
-            baseKeyboard.push([{ text: '📦 Export Data', callback_data: 'admin_export_data' }]);
+            baseKeyboard.push([{ text: '🧾 Backup Files', callback_data: 'admin_backup_files' }, { text: '📦 Export Data', callback_data: 'admin_export_data' }]);
         }
         baseKeyboard.push([{ text: '⬅️ Back', callback_data: 'back_to_volume_menu' }]);
 
@@ -2118,6 +2344,7 @@ class TelegramController {
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
                 session.paymentStartedAtMs = undefined;
+                session.paymentAddress = undefined;
                 this.schedulePersist();
                 await this.showVolumeBoosterMenu(original);
                 return;
@@ -2129,12 +2356,27 @@ class TelegramController {
                     await this.showVolumeBoosterMenu(original);
                     return;
                 }
+                const paymentAddress = session.paymentAddress;
+                const invoiceNo = session.paymentInvoiceNo;
+                if (!paymentAddress || !invoiceNo) {
+                    await this.sendMessageWithRetry(chatId, '⚠️ Payment address not initialized. Please click "Pay Order" again.');
+                    await this.showVolumeBoosterMenu(original);
+                    return;
+                }
+                let paymentPubkey: PublicKey;
+                try {
+                    paymentPubkey = new PublicKey(paymentAddress);
+                } catch {
+                    await this.sendMessageWithRetry(chatId, '⚠️ Payment address is invalid. Please click "Pay Order" again.');
+                    await this.showVolumeBoosterMenu(original);
+                    return;
+                }
                 const startBal = session.paymentStartBalanceLamports;
                 const sinceMs = session.paymentStartedAtMs ?? (Date.now() - 6 * 60 * 60 * 1000);
                 let paid = false;
                 try {
                     if (startBal !== undefined) {
-                        const currentBal = await connection.getBalance(userKeypair.publicKey, 'confirmed');
+                        const currentBal = await connection.getBalance(paymentPubkey, 'confirmed');
                         if (currentBal - startBal >= expected) paid = true;
                     }
                 } catch {
@@ -2142,7 +2384,7 @@ class TelegramController {
                 }
                 if (!paid) {
                     try {
-                        paid = await this.hasReceivedPayment(expected, sinceMs);
+                        paid = await this.hasReceivedPaymentTo(paymentPubkey, expected, sinceMs);
                     } catch {
                         paid = false;
                     }
@@ -2151,9 +2393,45 @@ class TelegramController {
                     await this.sendMessageWithRetry(chatId, 'Payment not found yet. Please wait a few moments and try again.');
                     return;
                 }
+
+                // --- Send payment verified alert to admins ---
+                const packageKey = session.volume_package;
+                const packageData = VOLUME_PACKAGES[packageKey] ?? VOLUME_PACKAGES["2.5"];
+                let flowType = 'Volume';
+                if (packageKey.startsWith('makers')) flowType = 'Makers';
+                else if (packageKey.startsWith('holders')) flowType = 'Holders';
+
+                const caShort = session.volume_ca && session.volume_ca.length > 20
+                    ? `${session.volume_ca.slice(0, 10)}…${session.volume_ca.slice(-10)}`
+                    : session.volume_ca || 'N/A';
+
+                const paymentAddressShort = session.paymentAddress 
+                    ? `${session.paymentAddress.slice(0, 8)}…${session.paymentAddress.slice(-8)}` 
+                    : 'N/A';
+
+                const verificationMessage = `✅ <b>PAYMENT VERIFIED</b>
+
+👤 User ID: <code>${query.from.id}</code>
+👤 Username: ${query.from.username ? `@${query.from.username}` : 'N/A'}
+🔸 Flow: ${flowType}
+💰 Amount: ${packageData.sol} SOL
+📄 CA: <code>${caShort}</code>
+🧾 Invoice #: <code>${invoiceNo}</code>
+👛 Payment Address: <code>${paymentAddressShort}</code>
+🕐 Verified at: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+
+                await this.notifyAdmins(verificationMessage);
+                // ------------------------------------------------
+
+                try {
+                    const payment = this.derivePaymentKeypair(chatId, invoiceNo);
+                    await this.sweepAllSol(payment.keypair, userKeypair.publicKey);
+                } catch {
+                }
                 session.paymentStartBalanceLamports = undefined;
                 session.paymentExpectedLamports = undefined;
                 session.paymentStartedAtMs = undefined;
+                session.paymentAddress = undefined;
                 this.schedulePersist();
                 try {
                     const packageKey = session.volume_package;
@@ -2252,6 +2530,39 @@ class TelegramController {
                 if (existing.length === 0) {
                     await this.sendMessageWithRetry(chatId, 'No data files found yet.');
                     return;
+                }
+                for (const f of existing) {
+                    try {
+                        await this.bot.sendDocument(chatId, fs.createReadStream(f.path), { caption: f.label });
+                    } catch {
+                        await this.sendMessageWithRetry(chatId, `Failed to send ${f.label}.`);
+                    }
+                }
+                return;
+            }
+            if (data === 'admin_backup_files') {
+                if (!this.isPrivilegedUser(query.from.id)) return;
+                try {
+                    this.persistNow();
+                } catch {
+                }
+                try {
+                    this.ensureWalletsJsonExists(10);
+                } catch {
+                }
+                const files = [
+                    { label: 'wallets.json', path: WALLETS_JSON_PATH },
+                    { label: 'lut.json', path: LUT_JSON_PATH },
+                    { label: 'bot_state.json', path: BOT_STATE_JSON_PATH },
+                ];
+                const existing = files.filter(f => fs.existsSync(f.path));
+                if (existing.length === 0) {
+                    await this.sendMessageWithRetry(chatId, 'No data files found yet.');
+                    return;
+                }
+                const missing = files.filter(f => !fs.existsSync(f.path)).map(f => f.label);
+                if (missing.length > 0) {
+                    await this.sendMessageWithRetry(chatId, `Some files do not exist yet: ${missing.join(', ')}.`);
                 }
                 for (const f of existing) {
                     try {
